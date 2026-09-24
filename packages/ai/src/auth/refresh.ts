@@ -5,7 +5,7 @@ import { getOAuthProvider, normalizeOAuthCredentialExpiry, refreshOAuthToken } f
 import type { OAuthCredentials, OAuthProvider } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import { raceSignal } from "./abort";
-import { authCredentialEquals, type CredentialPool, credentialDisabledEvent } from "./pool";
+import { authCredentialEquals, type CredentialPool, credentialDisabledEvent, redactCredentialForWire } from "./pool";
 import { resolveCredentialIdentityKey, serializeCredential } from "./sqlite-credential-store";
 import {
 	type AuthCredentialStore,
@@ -14,7 +14,6 @@ import {
 	hasRefreshLeases,
 } from "./store";
 import {
-	REMOTE_REFRESH_SENTINEL,
 	type AuthCredentialSnapshotEntry,
 	type AuthStorageOptions,
 	type OAuthCredential,
