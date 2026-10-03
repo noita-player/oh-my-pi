@@ -469,7 +469,7 @@
 ## [18.6.0] - 2026-10-03
 ### Added
 
-- Added Kiro to the model catalog with automatic discovery of every model available to the signed-in Kiro account.
+- Added Kiro to the model catalog with automatic discovery of every model available to the signed-in Kiro account ([#14215](https://github.com/can1357/oh-my-pi/pull/14215) by [@ajdiyassin](https://github.com/ajdiyassin)).
 
 ### Fixed
 

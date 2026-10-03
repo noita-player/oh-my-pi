@@ -4,6 +4,8 @@ import { apiRouteFor } from "../compat/behavior";
 import { providerEntry, seedModels } from "../compat/providers";
 import { type CodexModelDiscoveryResult, fetchCodexModels } from "../discovery/codex";
 import type { DevinModelDiscoveryOptions } from "../discovery/devin";
+import { fetchKiroModels } from "../discovery/kiro";
+
 import {
 	type FactoryDroidModelDiscoveryOptions,
 	factoryDroidSeedModels,
@@ -467,7 +469,6 @@ export function kiroModelManagerOptions(config: KiroModelManagerConfig = {}): Mo
 		...(config.apiKey
 			? {
 					fetchDynamicModels: async () => {
-						const { fetchKiroModels } = await kiroDiscovery();
 						const credential = parseKiroDiscoveryCredential(config.apiKey as string);
 						return fetchKiroModels({ credential, fetch: config.fetch });
 					},
@@ -475,8 +476,6 @@ export function kiroModelManagerOptions(config: KiroModelManagerConfig = {}): Mo
 			: undefined),
 	};
 }
-
-const kiroDiscovery = once(() => import("../discovery/kiro"));
 
 // ---------------------------------------------------------------------------
 // Zai
