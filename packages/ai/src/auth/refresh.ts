@@ -1007,7 +1007,7 @@ export class OAuthRefresher {
 					this.#requestOAuthCredentialRefresh(provider, current, credentialId, refreshSignal, reason, undefined),
 				// A usage probe is advisory: leave a dead grant for an interactive request to disable.
 				isDefinitiveFailure:
-					reason === "usage-probe" ? undefined : error => AIError.isDefinitiveOAuthFailure(String(error)),
+					reason === "usage-probe" ? undefined : error => AIError.isDefinitiveOAuthFailure(error),
 				disabledCause: error => `oauth refresh failed: ${String(error)}`,
 			});
 			if (result.credential) {
@@ -1035,6 +1035,7 @@ export class OAuthRefresher {
 			throw new AIError.OAuthError(`OAuth credential no longer exists for provider: ${provider}`, {
 				kind: "token-refresh",
 				provider,
+				definitive: result.removed,
 			});
 		}
 		return this.#requestOAuthCredentialRefresh(
@@ -1201,7 +1202,7 @@ export class OAuthRefresher {
 				// attempted credential is known. CAS on the persisted credential so a
 				// peer/login rotation in flight leaves the freshly-rotated row intact.
 				// A usage probe is advisory: leave a dead grant for an interactive request to disable.
-				if (reason !== "usage-probe" && AIError.isDefinitiveOAuthFailure(String(error))) {
+				if (reason !== "usage-probe" && AIError.isDefinitiveOAuthFailure(error)) {
 					// CAS-loss (false) means a peer/login rotated the row mid-refresh, so
 					// our #data copy is stale — reload so the next caller serves the
 					// freshly-rotated credential rather than the dead token we attempted.
