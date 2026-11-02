@@ -6,6 +6,7 @@ import {
 	type CredentialDisabledEvent,
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai/auth-storage";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import { logger } from "@oh-my-pi/pi-utils";
 
@@ -173,6 +174,29 @@ describe("AuthStorage credential_disabled subscriptions", () => {
 			};
 			expect(events).toEqual([expected]);
 			expect(warn).toHaveBeenCalledWith("Auth credential disabled", expected);
+		});
+
+		test("disables a row from typed definitive metadata without provider-specific message matching", async () => {
+			const events: CredentialDisabledEvent[] = [];
+			const authStorage = openStorage({
+				onCredentialDisabled: event => {
+					events.push(event);
+				},
+			});
+			await authStorage.credentials.set("anthropic", [expiredOAuth()]);
+			vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
+				throw new AIError.OAuthError("opaque dead grant", {
+					kind: "token-refresh",
+					provider: "anthropic",
+					definitive: true,
+				});
+			});
+
+			await authStorage.keys.get("anthropic", "session-typed-definitive");
+
+			expect(events).toHaveLength(1);
+			expect(events[0]).toMatchObject({ provider: "anthropic", credentialId: 1 });
+			expect(authStorage.credentials.has("anthropic")).toBe(false);
 		});
 
 		test("names the disabled row and account when a credential is disabled by id", async () => {

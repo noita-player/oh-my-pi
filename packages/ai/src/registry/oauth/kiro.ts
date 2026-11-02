@@ -720,12 +720,14 @@ export async function refreshKiroToken(
 		throw new AIError.OAuthError("Kiro refresh state is incomplete; run /login kiro again", {
 			kind: "configuration",
 			provider: PROVIDER,
+			definitive: true,
 		});
 	}
 	if (!current.refresh) {
 		throw new AIError.OAuthError("Kiro refresh requires a refresh token", {
 			kind: "configuration",
 			provider: PROVIDER,
+			definitive: true,
 		});
 	}
 	if (
@@ -736,6 +738,7 @@ export async function refreshKiroToken(
 		throw new AIError.OAuthError("Kiro registered client expired; run /login kiro again", {
 			kind: "token-refresh",
 			provider: PROVIDER,
+			definitive: true,
 		});
 	}
 	let parsed: URL;
@@ -746,6 +749,7 @@ export async function refreshKiroToken(
 			kind: "configuration",
 			provider: PROVIDER,
 			cause,
+			definitive: true,
 		});
 	}
 	if (
@@ -758,12 +762,17 @@ export async function refreshKiroToken(
 		parsed.username !== "" ||
 		parsed.password !== ""
 	) {
-		throw new AIError.OAuthError("Invalid Kiro refresh endpoint", { kind: "configuration", provider: PROVIDER });
+		throw new AIError.OAuthError("Invalid Kiro refresh endpoint", {
+			kind: "configuration",
+			provider: PROVIDER,
+			definitive: true,
+		});
 	}
 	if (current.kiroOidcRegion && parsed.hostname !== `oidc.${current.kiroOidcRegion}.amazonaws.com`) {
 		throw new AIError.OAuthError("Kiro refresh endpoint does not match the credential Region", {
 			kind: "configuration",
 			provider: PROVIDER,
+			definitive: true,
 		});
 	}
 	const response = await request(
@@ -782,11 +791,21 @@ export async function refreshKiroToken(
 		"token-refresh",
 	);
 	if (!response.response.ok) {
-		throw new AIError.OAuthError(`Kiro refresh failed: HTTP ${response.response.status}`, {
-			kind: "token-refresh",
-			provider: PROVIDER,
-			status: response.response.status,
-		});
+		const body =
+			typeof response.body === "object" && response.body !== null && !Array.isArray(response.body)
+				? (response.body as Record<string, unknown>)
+				: undefined;
+		const oauthCode = typeof body?.error === "string" ? body.error : undefined;
+		const definitive = oauthCode === "invalid_grant" || oauthCode === "expired_token";
+		throw new AIError.OAuthError(
+			`Kiro refresh failed: HTTP ${response.response.status}${definitive ? ` ${oauthCode}` : ""}`,
+			{
+				kind: "token-refresh",
+				provider: PROVIDER,
+				status: response.response.status,
+				definitive,
+			},
+		);
 	}
 	return {
 		...current,

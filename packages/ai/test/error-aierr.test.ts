@@ -13,6 +13,18 @@ describe("AIError.classify — structural provider errors", () => {
 		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
 	});
 
+	it("preserves typed OAuth-expiry classification through finalization", async () => {
+		const error = new AIError.OAuthError("opaque dead grant", {
+			kind: "token-refresh",
+			provider: "test",
+			definitive: true,
+		});
+		const result = await AIError.finalize(error, { provider: "test" });
+		expect(AIError.is(result.id, AIError.Flag.AuthFailed)).toBe(true);
+		expect(AIError.is(result.id, AIError.Flag.OAuthExpiry)).toBe(true);
+		expect(AIError.stringify(result.id)).toContain("oauth-expiry");
+	});
+
 	it("maps a 5xx ProviderHttpError to transient via status", () => {
 		const id = AIError.classify(new AIError.ProviderHttpError("Service Unavailable", 503));
 		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
