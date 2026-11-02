@@ -20,6 +20,7 @@ import {
 	iterateWithIdleTimeout,
 } from "../../utils/idle-iterator";
 import { notifyProviderResponse } from "../../utils/provider-response";
+import { waitForRetry } from "../../utils/retry-wait";
 import { decodeEventStream } from "../aws-eventstream";
 import {
 	isKiroCapacityError,
@@ -32,7 +33,7 @@ import {
 import { mergeKiroUsage, normalizeKiroFrame } from "./event-normalizer";
 import { KiroToolAssembler } from "./tool-assembler";
 import { transformKiroRequest } from "./transform";
-import type { KiroNormalizedEvent, KiroOptions, KiroUsageMetrics } from "./types";
+import type { KiroNormalizedEvent, KiroOptions, KiroRefusalDetails, KiroUsageMetrics } from "./types";
 
 const KIRO_RUNTIME_TARGET = "KiroRuntimeService.GenerateAssistantResponse";
 const KIRO_USER_AGENT = "oh-my-pi/kiro-api";
@@ -78,6 +79,7 @@ interface AttemptState {
 	/** The service sent `meteringEvent`: this request was billed and must not be replayed. */
 	metered: boolean;
 	stopReason?: string;
+	refusal?: KiroRefusalDetails;
 	semanticEvents: number;
 	toolAssembler: KiroToolAssembler;
 }
@@ -348,32 +350,29 @@ function createAttempt(model: Model, stream: AssistantMessageEventStream, timest
 	return state;
 }
 
-async function waitBeforeRecovery(options: KiroOptions | undefined, signal: AbortSignal | undefined): Promise<void> {
-	const delayMs = 500;
-	if (options?.providerRetryWait) {
-		await options.providerRetryWait(delayMs, signal);
-		return;
-	}
-	signal?.throwIfAborted();
-	if (!signal) {
-		await Bun.sleep(delayMs);
-		return;
-	}
-	// `Bun.sleep` takes no signal, so race it against abort to keep pre-output
-	// recovery cancellable.
-	const aborted = Promise.withResolvers<never>();
-	const onAbort = () => aborted.reject(signal.reason);
-	signal.addEventListener("abort", onAbort, { once: true });
-	try {
-		await Promise.race([Bun.sleep(delayMs), aborted.promise]);
-	} finally {
-		signal.removeEventListener("abort", onAbort);
-	}
+async function finishError(
+	state: AttemptState,
+	stream: AssistantMessageEventStream,
+	error: unknown,
+	model: Model,
+	signal: AbortSignal | undefined,
+	startTime: number,
+): Promise<void> {
+	const result = await AIError.finalize(error, { api: model.api, provider: model.provider, signal });
+	state.output.stopReason = result.stopReason;
+	state.output.errorMessage = result.message;
+	state.output.errorStatus = result.status;
+	state.output.errorId = result.id;
+	state.output.duration = performance.now() - startTime;
+	if (state.firstOutputTime !== undefined) state.output.ttft = state.firstOutputTime - startTime;
+	stream.push({ type: "error", reason: result.stopReason, error: state.output });
+	stream.end();
 }
 
 function isTruncatedFrame(error: unknown): boolean {
 	return error instanceof AIError.EventStreamFrameError && error.message.includes("truncated message");
 }
+
 
 /** Native Kiro stream implementation. */
 export function streamKiro(model: Model, context: Context, options: KiroOptions = {}): AssistantMessageEventStream {
@@ -437,7 +436,7 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 						// An HTTP rejection has produced no output and no bill.
 						if ((isKiroCapacityError(error) || isKiroTransientToolFormatError(error)) && attempt < MAX_ATTEMPTS) {
 							attempt++;
-							await waitBeforeRecovery(options, options.signal);
+							await waitForRetry(options.providerRetryWait, 500, options.signal);
 							continue;
 						}
 						throw error;
@@ -488,6 +487,7 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 							case "metadata":
 								if (event.requestId) state.output.responseId = event.requestId;
 								if (event.stopReason) state.stopReason = event.stopReason;
+								if (event.refusal) state.refusal = event.refusal;
 								break;
 							case "reasoning":
 								state.nativeReasoning = true;
@@ -517,13 +517,37 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 					// service already billed the request.
 					if (isTruncatedFrame(error) && !state.visible && !state.metered && attempt < MAX_ATTEMPTS) {
 						attempt++;
-						await waitBeforeRecovery(options, options.signal);
+						await waitForRetry(options.providerRetryWait, 500, options.signal);
 						continue;
 					}
 					throw error;
 				}
+				const contentFiltered = state.stopReason === "CONTENT_FILTERED" || state.refusal !== undefined;
+				const truncated = state.stopReason === "MAX_TOKENS" || state.stopReason === "LENGTH";
+				// Close inline blocks first: dropping a truncated tool call shifts later content indices.
 				finalizeInline(state, stream);
-				state.toolAssembler.finishAll(state.stopReason === "MAX_TOKENS" || state.stopReason === "LENGTH");
+				state.toolAssembler.finishAll(contentFiltered || truncated);
+				if (contentFiltered) {
+					finalizeUsage(state, model);
+					const category = state.refusal?.category?.trim();
+					const explanation = state.refusal?.explanation?.trim();
+					const label = category ? `Refusal (${category})` : "Refusal";
+					const message = explanation ? `${label}: ${explanation}` : `${label}: content was filtered by Kiro`;
+					state.output.stopDetails = {
+						type: "refusal",
+						category: category ?? null,
+						explanation: explanation ?? null,
+					};
+					await finishError(
+						state,
+						stream,
+						new KiroStreamError(message, { code: "CONTENT_FILTERED", kind: "content-blocked" }),
+						model,
+						options.signal,
+						startTime,
+					);
+					return;
+				}
 				if (!state.visible) {
 					throw new KiroStreamError("Kiro stream ended without visible output", {
 						code: "EMPTY_STREAM",
@@ -546,19 +570,7 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 				return;
 			}
 		} catch (error) {
-			const result = await AIError.finalize(error, {
-				api: model.api,
-				provider: model.provider,
-				signal: options.signal,
-			});
-			state.output.stopReason = result.stopReason;
-			state.output.errorMessage = result.message;
-			state.output.errorStatus = result.status;
-			state.output.errorId = result.id;
-			state.output.duration = performance.now() - startTime;
-			if (state.firstOutputTime !== undefined) state.output.ttft = state.firstOutputTime - startTime;
-			stream.push({ type: "error", reason: result.stopReason, error: state.output });
-			stream.end();
+			await finishError(state, stream, error, model, options.signal, startTime);
 		}
 	})().catch(error => stream.fail(error));
 	return stream;

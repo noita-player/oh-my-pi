@@ -124,7 +124,8 @@ export function kiroEventStreamError(
 	const message = `${code}${detail ? `: ${detail}` : ""}`;
 	// A known shape carries the HTTP-equivalent status so the shared retry
 	// classifier can see through the HTTP 200 wrapper.
-	const status = codeValue === undefined ? undefined : kiroStreamExceptionStatus(codeValue);
+	const mappedStatus = codeValue === undefined ? undefined : kiroStreamExceptionStatus(codeValue);
+	const status = mappedStatus ?? (KIRO_TRANSIENT_HIGH_LOAD.test(message) ? 503 : undefined);
 	return status === undefined
 		? new KiroStreamError(message, { code, requestId })
 		: new KiroApiError(message, status, { code, requestId });
@@ -135,6 +136,14 @@ export function isKiroCapacityError(error: unknown): boolean {
 }
 
 const INVALID_TOOL_USE_FORMAT = "invalid tool use format";
+const KIRO_TRANSIENT_HIGH_LOAD = /\bencountered unexpectedly high load\b[\s\S]*\bplease try again\b/i;
+
+export function isKiroTransientHighLoadError(error: unknown): boolean {
+	return (
+		(error instanceof KiroApiError || error instanceof KiroStreamError) &&
+		KIRO_TRANSIENT_HIGH_LOAD.test(error.message)
+	);
+}
 
 /**
  * Whether a failure is the fleet's transient rejection of an otherwise valid
