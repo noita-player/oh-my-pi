@@ -589,7 +589,8 @@ describe("Kiro provider discovery", () => {
 		const gpt = result.models.find(model => model.id === "gpt-5.6-luna");
 
 		expect(claude?.tokenizer).toBe("claude-v3");
-		expect(gpt?.tokenizer).toBeUndefined();
+		// v18.15 resolves GPT-5+ identities to OpenAI's o200k tokenizer (#15446 rules).
+		expect(gpt?.tokenizer).toBe("o200k");
 		expect(claude?.contextWindow).toBe(100_000);
 		expect(gpt?.contextWindow).toBe(100_000);
 	});

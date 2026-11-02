@@ -268,7 +268,7 @@ export const streamGoogleVertex = createLazyProviderStream(
 /** Stream Kiro with provider-owned timeout handling. */
 export const streamKiro = createLazyProviderStream(
 	() => import("./kiro/index"),
-	mod => mod.streamKiro,
+	(mod): ProviderStream<"kiro-api"> => mod.streamKiro,
 	PROVIDER_HANDLED_STREAM_TIMEOUTS,
 );
 
