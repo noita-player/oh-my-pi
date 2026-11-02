@@ -3,10 +3,10 @@
 // ============================================================================
 
 import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
-import { encodeKiroOAuthRow } from "@oh-my-pi/pi-catalog/wire/kiro-credential";
 import { assertNotNativeKiroRegistration } from "../../api-registry";
 import * as AIError from "../../error";
 import { jwtExpiryMs, NEVER_EXPIRES } from "../engine/common";
+import { encodeKiroOAuthCredential } from "./kiro-credential";
 import { getProviderDefinition, PROVIDER_REGISTRY } from "../registry";
 import type {
 	OAuthCredentials,
@@ -145,7 +145,7 @@ export async function getOAuthApiKey(
 	// one model-cache scope per stored row.
 	const apiKey =
 		provider === "kiro"
-			? encodeKiroOAuthRow(creds)
+			? encodeKiroOAuthCredential(creds)
 			: policy?.apiKeyFormat === "structured"
 				? JSON.stringify({
 						apiEndpoint: creds.apiEndpoint,

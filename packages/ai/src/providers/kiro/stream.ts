@@ -32,13 +32,16 @@ import {
 
 import { mergeKiroUsage, normalizeKiroFrame } from "./event-normalizer";
 import { KiroToolAssembler } from "./tool-assembler";
-import { transformKiroRequest } from "./transform";
+import { serializeKiroRequest, transformKiroRequest } from "./transform";
 import type { KiroNormalizedEvent, KiroOptions, KiroRefusalDetails, KiroUsageMetrics } from "./types";
 
 const KIRO_RUNTIME_TARGET = "KiroRuntimeService.GenerateAssistantResponse";
 const KIRO_USER_AGENT = "oh-my-pi/kiro-api";
 /** Requests per call: the first plus at most one pre-output retry. */
 const MAX_ATTEMPTS = 2;
+const RETRY_DELAY_MS = 500;
+const KIRO_IDLE_TIMEOUT_MESSAGE = "Kiro stream timed out while waiting for the next event";
+const KIRO_FIRST_OUTPUT_TIMEOUT_MESSAGE = "Kiro stream timed out while waiting for the first visible output";
 
 function mergeHeaders(...headerSources: (Record<string, string> | undefined)[]): Record<string, string> {
 	const merged: Record<string, string> = {};
@@ -80,7 +83,6 @@ interface AttemptState {
 	metered: boolean;
 	stopReason?: string;
 	refusal?: KiroRefusalDetails;
-	semanticEvents: number;
 	toolAssembler: KiroToolAssembler;
 }
 
@@ -344,7 +346,6 @@ function createAttempt(model: Model, stream: AssistantMessageEventStream, timest
 		inlineBuffer: "",
 		usage: {},
 		metered: false,
-		semanticEvents: 0,
 		toolAssembler,
 	};
 	return state;
@@ -369,8 +370,14 @@ async function finishError(
 	stream.end();
 }
 
-function isTruncatedFrame(error: unknown): boolean {
-	return error instanceof AIError.EventStreamFrameError && error.message.includes("truncated message");
+/** One replay, only before output or billing, for the three documented failures. */
+function shouldRetry(state: AttemptState, attempt: number, error: unknown): boolean {
+	if (attempt >= MAX_ATTEMPTS || state.visible || state.metered) return false;
+	return (
+		isKiroCapacityError(error) ||
+		isKiroTransientToolFormatError(error) ||
+		(error instanceof AIError.EventStreamFrameError && error.message.includes("truncated message"))
+	);
 }
 
 
@@ -385,23 +392,30 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 		try {
 			const credential = parseCredential(typeof options.apiKey === "string" ? options.apiKey : undefined);
 			const runtimeBaseUrl = resolveKiroRuntimeBaseUrl(model, credential);
+			// Build the wire body once: provider retries must replay byte-identical
+			// requests and must not rerun a stateful payload hook.
+			let payload = transformKiroRequest(model, context, {
+				reasoning: options.reasoning,
+				disableReasoning: options.disableReasoning,
+				hideThinkingSummary: options.hideThinkingSummary,
+				maxTokens: options.maxTokens,
+				conversationId,
+			});
+			if (credential.kind === "oauth" && credential.profileArn) payload.profileArn = credential.profileArn;
+			const replacement = await options.onPayload?.(payload, model);
+			if (replacement !== undefined) payload = replacement as typeof payload;
+			const body = serializeKiroRequest(model, payload);
 			let attempt = 1;
 			// Resolved once per request: caller option → environment override → shared helper default.
 			const idleTimeoutMs = options.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
 			const firstEventTimeoutMs = options.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
 			while (true) {
 				state = createAttempt(model, stream, timestamp);
-				let payload = transformKiroRequest(model, context, {
-					reasoning: options.reasoning,
-					disableReasoning: options.disableReasoning,
-					hideThinkingSummary: options.hideThinkingSummary,
-					maxTokens: options.maxTokens,
-					conversationId,
-				});
-				if (credential.kind === "oauth" && credential.profileArn) payload.profileArn = credential.profileArn;
-				const replacement = await options.onPayload?.(payload, model);
-				if (replacement !== undefined) payload = replacement as typeof payload;
 				const watchdog = armPreResponseTimeout(options.signal, firstEventTimeoutMs);
+				// Owned by this attempt: a stream timeout aborts it to close the fetch
+				// and its body. Cancelling the body directly is invalid while the
+				// decoder holds its reader lock.
+				const transport = new AbortController();
 				let response: Response;
 				try {
 					response = await (options.fetch ?? globalThis.fetch)(runtimeBaseUrl, {
@@ -416,8 +430,8 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 							"amz-sdk-request": `attempt=${attempt}; max=${MAX_ATTEMPTS}`,
 							"user-agent": KIRO_USER_AGENT,
 						}),
-						body: JSON.stringify(payload),
-						signal: watchdog.signal,
+						body,
+						signal: watchdog.signal ? AbortSignal.any([watchdog.signal, transport.signal]) : transport.signal,
 					});
 				} catch (error) {
 					watchdog.clear();
@@ -429,14 +443,20 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 				if (response.ok) watchdog.clear();
 				const headerRequestId =
 					response.headers.get("x-amzn-requestid") ?? response.headers.get("x-amz-request-id");
-				await notifyProviderResponse(options, response, model, headerRequestId);
+				try {
+					await notifyProviderResponse(options, response, model, headerRequestId);
+				} catch (error) {
+					watchdog.clear();
+					transport.abort(error);
+					await response.body?.cancel(error).catch(() => {});
+					throw error;
+				}
 				if (!response.ok) {
 					try {
 						const error = await kiroHttpError(response, watchdog.signal);
-						// An HTTP rejection has produced no output and no bill.
-						if ((isKiroCapacityError(error) || isKiroTransientToolFormatError(error)) && attempt < MAX_ATTEMPTS) {
+						if (shouldRetry(state, attempt, error)) {
 							attempt++;
-							await waitForRetry(options.providerRetryWait, 500, options.signal);
+							await waitForRetry(options.providerRetryWait, RETRY_DELAY_MS, options.signal);
 							continue;
 						}
 						throw error;
@@ -457,14 +477,11 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 				const frames = iterateWithIdleTimeout(normalizedFrames, {
 					idleTimeoutMs,
 					firstItemTimeoutMs: firstEventTimeoutMs,
-					errorMessage: "Kiro stream timed out while waiting for the next event",
-					firstItemErrorMessage: "Kiro stream timed out while waiting for the first visible output",
-					onIdle: () => {
-						void responseBody.cancel().catch(() => {});
-					},
-					onFirstItemTimeout: () => {
-						void responseBody.cancel().catch(() => {});
-					},
+					errorMessage: KIRO_IDLE_TIMEOUT_MESSAGE,
+					firstItemErrorMessage: KIRO_FIRST_OUTPUT_TIMEOUT_MESSAGE,
+					onIdle: () => transport.abort(new AIError.StreamTimeoutError(KIRO_IDLE_TIMEOUT_MESSAGE)),
+					onFirstItemTimeout: () =>
+						transport.abort(new AIError.StreamTimeoutError(KIRO_FIRST_OUTPUT_TIMEOUT_MESSAGE)),
 					abortSignal: options.signal,
 					isProgressItem: event => {
 						const normalizedEvent = event as KiroNormalizedEvent;
@@ -482,12 +499,12 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 				});
 				try {
 					for await (const event of frames) {
-						if (event.type !== "ignored") state.semanticEvents++;
 						switch (event.type) {
 							case "metadata":
 								if (event.requestId) state.output.responseId = event.requestId;
 								if (event.stopReason) state.stopReason = event.stopReason;
 								if (event.refusal) state.refusal = event.refusal;
+								if (event.usage) mergeKiroUsage(state.usage, event.usage);
 								break;
 							case "reasoning":
 								state.nativeReasoning = true;
@@ -513,11 +530,9 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 						}
 					}
 				} catch (error) {
-					// A frame cut off before any output is replayed once, unless the
-					// service already billed the request.
-					if (isTruncatedFrame(error) && !state.visible && !state.metered && attempt < MAX_ATTEMPTS) {
+					if (shouldRetry(state, attempt, error)) {
 						attempt++;
-						await waitForRetry(options.providerRetryWait, 500, options.signal);
+						await waitForRetry(options.providerRetryWait, RETRY_DELAY_MS, options.signal);
 						continue;
 					}
 					throw error;

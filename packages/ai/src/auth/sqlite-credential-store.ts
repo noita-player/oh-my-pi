@@ -10,6 +10,7 @@ import * as path from "node:path";
 import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import { parseAlibabaTokenPlanCredential } from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
 import { parseCloudflareCredential } from "@oh-my-pi/pi-catalog/wire/cloudflare";
+import { extractKiroProfileSegment } from "@oh-my-pi/pi-catalog/wire/kiro";
 import {
 	getAgentDbPath,
 	getDbBusyTimeoutMs,
@@ -135,6 +136,17 @@ function normalizeStoredEmail(email: string | null | undefined): string | null {
 function normalizeStoredIdentityKey(identityKey: string | null | undefined): string | null {
 	const normalized = identityKey?.trim();
 	return normalized && normalized.length > 0 ? normalized : null;
+}
+
+/**
+ * The `orgId` a disable event or tombstone summary may report for a row. Kiro
+ * stores its profile ARN there, which embeds the AWS account id, so it reports
+ * only the ARN's trailing segment, and nothing for a value that is not a
+ * parseable profile ARN: unvalidated rows (`credentials.set`) reach here too.
+ */
+export function reportableOrgId(provider: string, orgId: string | undefined): string | undefined {
+	if (!orgId) return undefined;
+	return provider === "kiro" ? extractKiroProfileSegment(orgId) : orgId;
 }
 
 export function serializeCredential(provider: string, credential: AuthCredential): SerializedCredentialRecord | null {
@@ -1320,7 +1332,8 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			if (credential?.type === "oauth") {
 				if (credential.email) summary.email = credential.email;
 				if (credential.accountId) summary.accountId = credential.accountId;
-				if (credential.orgId) summary.orgId = credential.orgId;
+				const orgId = reportableOrgId(row.provider, credential.orgId);
+				if (orgId) summary.orgId = orgId;
 				if (credential.orgName) summary.orgName = credential.orgName;
 			}
 			if (typeof row.updated_at === "number" && Number.isFinite(row.updated_at)) {

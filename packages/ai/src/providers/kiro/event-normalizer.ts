@@ -3,8 +3,12 @@ import type { EventStreamMessage } from "../aws-eventstream";
 import { kiroEventStreamError } from "./errors";
 import type { KiroNormalizedEvent, KiroUsageMetrics } from "./types";
 
+// `metadataEvent.tokenUsage` is the runtime's `TokenUsage` shape
+// (`uncachedInputTokens`, `outputTokens`, `totalTokens`, `cacheReadInputTokens`,
+// `cacheWriteInputTokens`; Smithy model in aws/amazon-q-developer-cli).
+// `uncachedInputTokens` excludes cache reads and writes, matching `input`.
 const METRIC_ALIASES: Readonly<Record<keyof KiroUsageMetrics, readonly string[]>> = {
-	inputTokens: ["inputTokens", "input_tokens", "promptTokens", "prompt_tokens"],
+	inputTokens: ["inputTokens", "input_tokens", "promptTokens", "prompt_tokens", "uncachedInputTokens"],
 	outputTokens: ["outputTokens", "output_tokens", "completionTokens", "completion_tokens"],
 	cacheReadTokens: ["cacheReadTokens", "cache_read_tokens", "cacheReadInputTokens", "cachedTokens"],
 	cacheWriteTokens: [
@@ -13,14 +17,15 @@ const METRIC_ALIASES: Readonly<Record<keyof KiroUsageMetrics, readonly string[]>
 		"cacheWriteTokens",
 		"cache_write_tokens",
 		"cacheCreationInputTokens",
+		"cacheWriteInputTokens",
 	],
 	reasoningTokens: ["reasoningTokens", "reasoning_tokens", "reasoningOutputTokens"],
 };
 
 // `meteringEvent` is the live billing frame (`{ unit, unitPlural, usage }`, where
 // `usage` is fractional credits, not tokens). It carries no token counts; it is
-// surfaced as `metering` so the stream knows the request was billed and never
-// replays it. Token metrics come from the `metricsEvent`/`usage` envelopes below.
+// surfaced as its own event only so the stream knows the request was billed.
+// Token metrics come from `metadataEvent.tokenUsage` and the `metricsEvent`/`usage` envelopes below.
 const METRIC_EVENT_TYPES: Readonly<Record<string, true>> = {
 	metricsEvent: true,
 	usageEvent: true,
@@ -38,17 +43,39 @@ const KNOWN_EVENT_TYPES: Readonly<Record<string, true>> = {
 	...METRIC_EVENT_TYPES,
 };
 
+/** Shared across frames: every payload decode is a complete, non-streaming call. */
+const PAYLOAD_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+function parsePayload(message: EventStreamMessage): Record<string, unknown> {
+	const value: unknown = JSON.parse(PAYLOAD_DECODER.decode(message.payload));
+	if (!isRecord(value)) throw new Error("payload is not an object");
+	return value;
+}
+
 function decodePayload(message: EventStreamMessage): Record<string, unknown> {
 	try {
-		const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(message.payload));
-		if (!isRecord(value)) throw new Error("payload is not an object");
-		return value;
+		return parsePayload(message);
 	} catch (error) {
 		throw kiroEventStreamError(message.headers, {
 			code: "MALFORMED_EVENT_PAYLOAD",
 			message: error instanceof Error ? error.message : "invalid JSON",
 		});
 	}
+}
+
+/**
+ * An `error` frame usually has an empty payload, with the failure in its
+ * `:error-code` / `:error-message` headers. An empty or unparseable payload
+ * therefore contributes nothing, and the headers alone decide the error.
+ */
+function failureFrameError(message: EventStreamMessage): Error {
+	let payload: Record<string, unknown> | undefined;
+	if (message.payload.length > 0) {
+		try {
+			payload = parsePayload(message);
+		} catch {}
+	}
+	return kiroEventStreamError(message.headers, payload);
 }
 
 function normalizeMetrics(value: unknown): KiroUsageMetrics | undefined {
@@ -76,9 +103,9 @@ export function normalizeKiroFrame(message: EventStreamMessage): KiroNormalizedE
 	if (messageType !== "event" && messageType !== "exception" && messageType !== "error") {
 		return { type: "ignored" };
 	}
-	if (messageType === "event" && (!eventType || KNOWN_EVENT_TYPES[eventType] !== true)) return { type: "ignored" };
+	if (messageType === "exception" || messageType === "error") throw failureFrameError(message);
+	if (!eventType || KNOWN_EVENT_TYPES[eventType] !== true) return { type: "ignored" };
 	const payload = decodePayload(message);
-	if (messageType === "exception" || messageType === "error") throw kiroEventStreamError(message.headers, payload);
 
 	if (eventType === "initial-response" || eventType === "metadataEvent") {
 		// The live runtime reports terminal `stopReason` and classifier details on
@@ -91,11 +118,13 @@ export function normalizeKiroFrame(message: EventStreamMessage): KiroNormalizedE
 					...(typeof refusalValue.explanation === "string" ? { explanation: refusalValue.explanation } : {}),
 				}
 			: undefined;
+		const usage = normalizeMetrics(payload.tokenUsage);
 		return {
 			type: "metadata",
 			requestId: typeof payload.requestId === "string" ? payload.requestId : undefined,
 			stopReason: typeof payload.stopReason === "string" ? payload.stopReason : undefined,
 			...(refusal ? { refusal } : {}),
+			...(usage ? { usage } : {}),
 		};
 	}
 	if (eventType === "reasoningContentEvent") {

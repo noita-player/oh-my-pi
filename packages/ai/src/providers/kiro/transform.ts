@@ -157,9 +157,6 @@ function historicalResultCarrier(
 		userInputMessageContext: { toolResults: results },
 	};
 }
-function serializedHistoryBytes(history: readonly KiroHistoryEntry[]): number {
-	return new TextEncoder().encode(JSON.stringify(history)).byteLength;
-}
 function validateWireHistory(history: readonly KiroHistoryEntry[]): void {
 	let expected: "user" | "assistant" = "user";
 	const calls = new Set<string>();
@@ -285,12 +282,27 @@ export function transformKiroRequest(
 		...(request.conversationState.history ?? []),
 		{ userInputMessage: request.conversationState.currentMessage.userInputMessage },
 	]);
+	return request;
+}
+
+/**
+ * Serialize the request body once. The history is stringified on its own so
+ * its UTF-8 size can be checked against the scaled local limit, then spliced
+ * into the rest of the request at a per-call random slot; no part of the
+ * payload is serialized twice.
+ */
+export function serializeKiroRequest(model: Model, request: KiroRequest): string {
+	const history = request.conversationState?.history;
+	if (!history) return JSON.stringify(request);
+	const historyJson = JSON.stringify(history);
 	const contextWindow = model.contextWindow ?? HISTORY_BASE_TOKENS;
 	const maxHistoryBytes = Math.floor(HISTORY_BASE_BYTES * (contextWindow / HISTORY_BASE_TOKENS));
-	if (serializedHistoryBytes(request.conversationState.history ?? []) > maxHistoryBytes)
+	if (Buffer.byteLength(historyJson, "utf8") > maxHistoryBytes)
 		throw AIError.attach(
 			new Error(`Kiro history exceeds local limit of ${maxHistoryBytes} UTF-8 bytes`),
 			AIError.create(AIError.Flag.ContextOverflow),
 		);
-	return request;
+	const slot = `kiro-history-${crypto.randomUUID()}`;
+	const shell = JSON.stringify({ ...request, conversationState: { ...request.conversationState, history: slot } });
+	return shell.replace(`"${slot}"`, () => historyJson);
 }

@@ -6,6 +6,13 @@ const MAX_ERROR_BODY_BYTES = 64 * 1024;
 const MAX_ERROR_MESSAGE_CHARS = 500;
 const MAX_ERROR_CODE_CHARS = 100;
 const MAX_REQUEST_ID_CHARS = 200;
+const ERROR_BODY_DECODER = new TextDecoder();
+/**
+ * `ThrottlingExceptionReason` value the runtime puts in a `ThrottlingError`'s
+ * `reason` field when the selected model has no capacity (Smithy model shipped
+ * in aws/amazon-q-developer-cli `amzn-codewhisperer-streaming-client`).
+ */
+const INSUFFICIENT_MODEL_CAPACITY = "INSUFFICIENT_MODEL_CAPACITY";
 
 function boundedMessage(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
@@ -16,17 +23,21 @@ function boundedIdentifier(value: unknown, limit: number): string | undefined {
 	return value.replace(/[^\w.:/#-]/g, "").slice(0, limit);
 }
 
+interface KiroErrorDetails {
+	requestId?: string;
+	/** Structured `reason` from the error shape, e.g. `INSUFFICIENT_MODEL_CAPACITY`. */
+	reason?: string;
+}
+
 export class KiroApiError extends AIError.ProviderHttpError {
 	override readonly name = "KiroApiError";
 	readonly requestId: string | undefined;
+	readonly reason: string | undefined;
 
-	constructor(
-		message: string,
-		status: number,
-		options: AIError.ProviderHttpErrorOptions & { requestId?: string } = {},
-	) {
+	constructor(message: string, status: number, options: AIError.ProviderHttpErrorOptions & KiroErrorDetails = {}) {
 		super(message, status, options);
 		this.requestId = options.requestId;
+		this.reason = options.reason;
 	}
 }
 
@@ -61,7 +72,7 @@ export async function kiroHttpError(response: Response, signal?: AbortSignal): P
 	const body = await readBoundedBytes(response, MAX_ERROR_BODY_BYTES, { truncate: true, signal });
 	let parsed: Record<string, unknown> | undefined;
 	try {
-		const value: unknown = JSON.parse(new TextDecoder().decode(body));
+		const value: unknown = JSON.parse(ERROR_BODY_DECODER.decode(body));
 		parsed = isRecord(value) ? value : undefined;
 	} catch {}
 	const codeValue = parsed?.__type ?? parsed?.code ?? parsed?.error;
@@ -69,9 +80,10 @@ export async function kiroHttpError(response: Response, signal?: AbortSignal): P
 		typeof codeValue === "string" ? codeValue.split("#").at(-1) : undefined,
 		MAX_ERROR_CODE_CHARS,
 	);
+	const reason = boundedIdentifier(parsed?.reason, MAX_ERROR_CODE_CHARS);
 	const detail = boundedMessage(parsed?.message) ?? boundedMessage(parsed?.reason);
 	const message = `Kiro HTTP ${response.status}${code ? ` ${code}` : ""}${detail ? `: ${detail}` : ""}`;
-	const error = new KiroApiError(message, response.status, { headers: response.headers, code, requestId });
+	const error = new KiroApiError(message, response.status, { headers: response.headers, code, requestId, reason });
 	return response.status === 413 ? AIError.attach(error, AIError.create(AIError.Flag.ContextOverflow)) : error;
 }
 
@@ -99,6 +111,8 @@ const KIRO_STREAM_EXCEPTION_STATUS: Record<string, number> = {
 	serviceunavailableexception: 503,
 	slowdown: 429,
 	throttledexception: 429,
+	// The runtime's own throttling shape (`GenerateAssistantResponse` errors).
+	throttlingerror: 429,
 	throttlingexception: 429,
 };
 
@@ -112,6 +126,12 @@ export function kiroStreamExceptionStatus(code: string): number | undefined {
 	return KIRO_STREAM_EXCEPTION_STATUS[code.trim().toLowerCase()];
 }
 
+/**
+ * Build the error for an `exception`/`error` frame or a malformed semantic
+ * frame. AWS `:message-type=error` frames carry `:error-code` and
+ * `:error-message` headers, usually with an empty payload, so the headers are
+ * the evidence; a payload, when present, supplies the shape's own fields.
+ */
 export function kiroEventStreamError(
 	headers: Record<string, string>,
 	payload: unknown,
@@ -120,19 +140,23 @@ export function kiroEventStreamError(
 	const codeValue = headers[":exception-type"] ?? headers[":error-code"] ?? value?.code ?? value?.__type;
 	const code = boundedIdentifier(codeValue, MAX_ERROR_CODE_CHARS) ?? "KIRO_EVENTSTREAM_ERROR";
 	const requestId = boundedIdentifier(value?.requestId, MAX_REQUEST_ID_CHARS);
-	const detail = boundedMessage(value?.message);
+	const reason = boundedIdentifier(value?.reason, MAX_ERROR_CODE_CHARS);
+	const detail = boundedMessage(value?.message) ?? boundedMessage(headers[":error-message"]);
 	const message = `${code}${detail ? `: ${detail}` : ""}`;
 	// A known shape carries the HTTP-equivalent status so the shared retry
 	// classifier can see through the HTTP 200 wrapper.
-	const mappedStatus = codeValue === undefined ? undefined : kiroStreamExceptionStatus(codeValue);
-	const status = mappedStatus ?? (KIRO_TRANSIENT_HIGH_LOAD.test(message) ? 503 : undefined);
+	const mappedStatus = typeof codeValue === "string" ? kiroStreamExceptionStatus(codeValue) : undefined;
+	const status =
+		mappedStatus ??
+		(reason === INSUFFICIENT_MODEL_CAPACITY ? 429 : KIRO_TRANSIENT_HIGH_LOAD.test(message) ? 503 : undefined);
 	return status === undefined
 		? new KiroStreamError(message, { code, requestId })
-		: new KiroApiError(message, status, { code, requestId });
+		: new KiroApiError(message, status, { code, requestId, reason });
 }
 
+/** A `ThrottlingError` whose structured reason is missing model capacity, over HTTP or in-stream. */
 export function isKiroCapacityError(error: unknown): boolean {
-	return error instanceof KiroApiError && error.code === "INSUFFICIENT_MODEL_CAPACITY";
+	return error instanceof KiroApiError && error.reason === INSUFFICIENT_MODEL_CAPACITY;
 }
 
 const INVALID_TOOL_USE_FORMAT = "invalid tool use format";
