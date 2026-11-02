@@ -476,6 +476,7 @@ const ERROR_KIND_LABELS: readonly [Flag, string][] = [
 	[Flag.ContextOverflow, "context-overflow"],
 	[Flag.PayloadRejected, "payload-rejected"],
 	[Flag.AuthFailed, "auth-failed"],
+	[Flag.OAuthExpiry, "oauth-expiry"],
 	[Flag.SilentAbort, "silent-abort"],
 	[Flag.UserInterrupt, "user-interrupt"],
 	[Flag.Abort, "abort"],

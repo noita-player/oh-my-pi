@@ -901,14 +901,14 @@ describe("Kiro authentication", () => {
 
 		for (const { credentials } of cases) {
 			let called = false;
-			await expect(
-				refreshKiroToken(credentials, {
-					fetch: async () => {
-						called = true;
-						return json({ accessToken: "unexpected", expiresIn: 3600 });
-					},
-				}),
-			).rejects.toMatchObject({ kind: expect.anything() });
+			const error = await refreshKiroToken(credentials, {
+				fetch: async () => {
+					called = true;
+					return json({ accessToken: "unexpected", expiresIn: 3600 });
+				},
+			}).catch((cause: unknown) => cause);
+			expect(error).toMatchObject({ kind: expect.anything(), definitive: true });
+			expect(AIError.isDefinitiveOAuthFailure(error)).toBe(true);
 			expect(called).toBe(false);
 		}
 	});
@@ -970,15 +970,28 @@ describe("Kiro authentication", () => {
 		expect(retried).toMatchObject({ access: "new-access", refresh: "new-refresh" });
 
 		let semanticAttempts = 0;
-		await expect(
-			refreshKiroToken(current, {
-				fetch: async () => {
-					semanticAttempts += 1;
-					return json({ error: "invalid client" }, 400);
-				},
-			}),
-		).rejects.toMatchObject({ kind: "token-refresh", status: 400 });
+		const unknownClientError = await refreshKiroToken(current, {
+			fetch: async () => {
+				semanticAttempts += 1;
+				return json({ error: "invalid_client" }, 400);
+			},
+		}).catch((cause: unknown) => cause);
+		expect(unknownClientError).toMatchObject({ kind: "token-refresh", status: 400, definitive: false });
+		expect(AIError.isDefinitiveOAuthFailure(unknownClientError)).toBe(false);
 		expect(semanticAttempts).toBe(1);
+
+		for (const oauthCode of ["invalid_grant", "expired_token"]) {
+			const error = await refreshKiroToken(current, {
+				fetch: async () => json({ error: oauthCode, error_description: "must not be reflected" }, 400),
+			}).catch((cause: unknown) => cause);
+			expect(error).toMatchObject({
+				kind: "token-refresh",
+				status: 400,
+				definitive: true,
+				message: `Kiro refresh failed: HTTP 400 ${oauthCode}`,
+			});
+			expect(AIError.isDefinitiveOAuthFailure(error)).toBe(true);
+		}
 	});
 
 	it("disables the credential on a dead refresh grant and keeps it on other refresh failures", async () => {

@@ -758,12 +758,14 @@ export async function refreshKiroToken(
 		throw new AIError.OAuthError("Kiro refresh state is incomplete; run /login kiro again", {
 			kind: "configuration",
 			provider: PROVIDER,
+			definitive: true,
 		});
 	}
 	if (!current.refresh) {
 		throw new AIError.OAuthError("Kiro refresh requires a refresh token", {
 			kind: "configuration",
 			provider: PROVIDER,
+			definitive: true,
 		});
 	}
 	if (
@@ -774,6 +776,7 @@ export async function refreshKiroToken(
 		throw new AIError.OAuthError("Kiro registered client expired; run /login kiro again", {
 			kind: "token-refresh",
 			provider: PROVIDER,
+			definitive: true,
 		});
 	}
 	let parsed: URL;
@@ -784,6 +787,7 @@ export async function refreshKiroToken(
 			kind: "configuration",
 			provider: PROVIDER,
 			cause,
+			definitive: true,
 		});
 	}
 	if (
@@ -796,12 +800,17 @@ export async function refreshKiroToken(
 		parsed.username !== "" ||
 		parsed.password !== ""
 	) {
-		throw new AIError.OAuthError("Invalid Kiro refresh endpoint", { kind: "configuration", provider: PROVIDER });
+		throw new AIError.OAuthError("Invalid Kiro refresh endpoint", {
+			kind: "configuration",
+			provider: PROVIDER,
+			definitive: true,
+		});
 	}
 	if (current.kiroOidcRegion && parsed.hostname !== `oidc.${current.kiroOidcRegion}.amazonaws.com`) {
 		throw new AIError.OAuthError("Kiro refresh endpoint does not match the credential Region", {
 			kind: "configuration",
 			provider: PROVIDER,
+			definitive: true,
 		});
 	}
 	const response = await request(
@@ -820,14 +829,15 @@ export async function refreshKiroToken(
 		"token-refresh",
 	);
 	if (!response.response.ok) {
-		// A dead grant names itself in the OIDC error body. The message carries
-		// the code so `isDefinitiveOAuthFailure` disables the row with a re-login
-		// hint; any other failure stays transient and the row is retried.
+		// Preserve Kiro's provider-specific re-login message, but classify the
+		// failure structurally so every auth lifecycle path disables the row
+		// without depending on message text.
 		const permanent = permanentKiroRefreshFailure(response.body);
 		throw new AIError.OAuthError(permanent ?? `Kiro refresh failed: HTTP ${response.response.status}`, {
 			kind: "token-refresh",
 			provider: PROVIDER,
 			status: response.response.status,
+			definitive: permanent !== undefined,
 		});
 	}
 	return {
