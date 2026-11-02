@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import * as AIError from "@oh-my-pi/pi-ai/error";
-import { transformKiroRequest } from "@oh-my-pi/pi-ai/providers/kiro/index";
+import { serializeKiroRequest, transformKiroRequest } from "@oh-my-pi/pi-ai/providers/kiro/index";
 import type { AssistantMessage, Context, Model, Tool, ToolResultMessage, Usage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -558,12 +558,37 @@ describe("Kiro request transformation", () => {
 			],
 		};
 
+		const model = createModel({ contextWindow: 1 });
+		const request = transformKiroRequest(model, context);
 		try {
-			transformKiroRequest(createModel({ contextWindow: 1 }), context);
+			serializeKiroRequest(model, request);
 			expect.unreachable("expected local history overflow");
 		} catch (error) {
 			expect(AIError.is(AIError.classify(error), AIError.Flag.ContextOverflow)).toBe(true);
 		}
+	});
+
+	test("serializes the request body exactly as JSON.stringify would", () => {
+		const context: Context = {
+			messages: [
+				{ role: "user", content: 'History with "quotes", unicode \u00e9, and $& replacement tokens', timestamp: 0 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "answer $1" }],
+					api: "kiro-api",
+					provider: "kiro",
+					model: "kiro-test-model",
+					usage: zeroUsage,
+					stopReason: "stop",
+					timestamp: 1,
+				},
+				{ role: "user", content: "Continue", timestamp: 2 },
+			],
+		};
+		const model = createModel();
+		const request = transformKiroRequest(model, context, { conversationId: "session-1" });
+		expect(request.conversationState.history).toBeDefined();
+		expect(serializeKiroRequest(model, request)).toBe(JSON.stringify(request));
 	});
 
 	test("uses an explicit Kiro conversation identity", () => {

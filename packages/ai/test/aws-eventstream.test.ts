@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { crc32, decodeEventStream, decodeMessage } from "@oh-my-pi/pi-ai/providers/aws-eventstream";
+import {
+	crc32,
+	decodeEventStream,
+	decodeMessage,
+	MAX_HEADERS_LEN,
+	MAX_MESSAGE_LEN,
+} from "@oh-my-pi/pi-ai/providers/aws-eventstream";
 
 // ---- Frame builder (mirrors @smithy/eventstream-codec but in-process so the
 // test owns the bytes). The decoder is the production code; we encode here for
@@ -45,6 +51,19 @@ function encodeFrame(headers: Record<string, string>, payload: Uint8Array): Uint
 	out.set(payload, 12 + headerLen);
 	const msgCrc = crc32(out.subarray(0, total - 4));
 	view.setUint32(total - 4, msgCrc, false);
+	return out;
+}
+
+function encodeRawFrame(headers: Uint8Array, payload = new Uint8Array(0)): Uint8Array {
+	const total = 12 + headers.length + payload.length + 4;
+	const out = new Uint8Array(total);
+	const view = new DataView(out.buffer);
+	view.setUint32(0, total, false);
+	view.setUint32(4, headers.length, false);
+	view.setUint32(8, crc32(out.subarray(0, 8)), false);
+	out.set(headers, 12);
+	out.set(payload, 12 + headers.length);
+	view.setUint32(total - 4, crc32(out.subarray(0, total - 4)), false);
 	return out;
 }
 
@@ -155,5 +174,109 @@ describe("aws-eventstream", () => {
 		const frame = encodeFrame({ ":event-type": "x" }, new TextEncoder().encode("{}"));
 		frame[frame.length - 1] ^= 0xff;
 		expect(() => decodeMessage(frame)).toThrow(/message CRC/);
+	});
+
+	/** A 12-byte prelude declaring `total` and `headersLen`, with a valid prelude CRC. */
+	function prelude(total: number, headersLen: number): Uint8Array {
+		const out = new Uint8Array(12);
+		const view = new DataView(out.buffer);
+		view.setUint32(0, total, false);
+		view.setUint32(4, headersLen, false);
+		view.setUint32(8, crc32(out.subarray(0, 8)), false);
+		return out;
+	}
+
+	/** Endless body that counts pulls, so a test can see how much was read. */
+	function endlessAfter(first: Uint8Array): { stream: ReadableStream<Uint8Array>; pulls: () => number } {
+		let pulls = 0;
+		const stream = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				pulls += 1;
+				controller.enqueue(pulls === 1 ? first : new Uint8Array(64 * 1024));
+			},
+		});
+		return { stream, pulls: () => pulls };
+	}
+
+	test("rejects an oversized declared length from the prelude before buffering", async () => {
+		const body = endlessAfter(prelude(MAX_MESSAGE_LEN + 1, 0));
+		await expect(collect(body.stream)).rejects.toThrow(/exceeds maximum/);
+		expect(body.pulls()).toBe(1);
+	});
+
+	test("rejects a header length that does not fit the message", async () => {
+		const body = endlessAfter(prelude(64, 64));
+		await expect(collect(body.stream)).rejects.toThrow(/headers length 64 exceeds/);
+		expect(body.pulls()).toBe(1);
+	});
+
+	test("rejects an oversized encoded header block", async () => {
+		const body = endlessAfter(prelude(12 + MAX_HEADERS_LEN + 1 + 4, MAX_HEADERS_LEN + 1));
+		await expect(collect(body.stream)).rejects.toThrow(/headers length.*exceeds maximum/);
+		expect(body.pulls()).toBe(1);
+	});
+
+	test("rejects truncated header names and values without reading payload bytes", () => {
+		const truncatedName = encodeRawFrame(new Uint8Array([3, 0x61]));
+		expect(() => decodeMessage(truncatedName)).toThrow(/truncated EventStream header name or type/);
+
+		const stringIntoPayload = encodeRawFrame(
+			new Uint8Array([1, 0x78, 7, 0, 4, 0x61]),
+			new Uint8Array([0x62, 0x63, 0x64]),
+		);
+		expect(() => decodeMessage(stringIntoPayload)).toThrow(/truncated EventStream header string value/);
+
+		const bytesIntoPayload = encodeRawFrame(
+			new Uint8Array([1, 0x78, 6, 0, 4, 0x61]),
+			new Uint8Array([0x62, 0x63, 0x64]),
+		);
+		expect(() => decodeMessage(bytesIntoPayload)).toThrow(/truncated EventStream header byte-array value/);
+	});
+
+	test("rejects a corrupt prelude before trusting its lengths", async () => {
+		const bad = prelude(MAX_MESSAGE_LEN, 0);
+		bad[11] ^= 0xff;
+		const body = endlessAfter(bad);
+		await expect(collect(body.stream)).rejects.toThrow(/prelude CRC/);
+		expect(body.pulls()).toBe(1);
+	});
+
+	test("rejects an oversized declaration whose prelude spans chunks", async () => {
+		const head = prelude(MAX_MESSAGE_LEN + 1, 0);
+		await expect(collect(streamFrom([head.subarray(0, 5), head.subarray(5)]))).rejects.toThrow(/exceeds maximum/);
+	});
+
+	test("decodes frames delivered one byte at a time", async () => {
+		const a = encodeFrame({ ":message-type": "event", ":event-type": "a" }, new TextEncoder().encode('{"n":1}'));
+		const b = encodeFrame({ ":message-type": "event", ":event-type": "b" }, new TextEncoder().encode('{"n":2}'));
+		const bytes = new Uint8Array(a.length + b.length);
+		bytes.set(a, 0);
+		bytes.set(b, a.length);
+		const chunks = Array.from(bytes, byte => new Uint8Array([byte]));
+		const collected = await collect(streamFrom(chunks));
+		expect(collected.map(x => [x.headers[":event-type"], x.text])).toEqual([
+			["a", '{"n":1}'],
+			["b", '{"n":2}'],
+		]);
+	});
+
+	test("keeps yielded payloads intact while later chunks arrive", async () => {
+		const a = encodeFrame({ ":event-type": "a" }, new TextEncoder().encode("first"));
+		const b = encodeFrame({ ":event-type": "b" }, new TextEncoder().encode("second"));
+		const joined = new Uint8Array(a.length + b.length);
+		joined.set(a, 0);
+		joined.set(b, a.length);
+		const split = a.length + 3;
+		const payloads: Uint8Array[] = [];
+		for await (const msg of decodeEventStream(streamFrom([joined.subarray(0, split), joined.subarray(split)]))) {
+			payloads.push(msg.payload);
+		}
+		expect(payloads.map(payload => new TextDecoder().decode(payload))).toEqual(["first", "second"]);
+	});
+
+	test("reports a stream cut inside the prelude or the body as truncated", async () => {
+		const frame = encodeFrame({ ":event-type": "x" }, new TextEncoder().encode("{}"));
+		await expect(collect(streamFrom([frame.subarray(0, 6)]))).rejects.toThrow(/truncated message/);
+		await expect(collect(streamFrom([frame.subarray(0, frame.length - 1)]))).rejects.toThrow(/truncated message/);
 	});
 });

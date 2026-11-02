@@ -70,15 +70,15 @@ Run `/login kiro` again when:
 - the registered client or OAuth refresh state has expired;
 - the AWS profile, Start URL, or OIDC region has changed;
 - model discovery is using the wrong profile or endpoint; or
-- a present registration endpoint fails validation.
+- a registration response returns an invalid token endpoint.
 
 ## Transient request failures
 
-A Kiro request is retried at most once, with an identical request body and a fresh request id, and only before any output has been shown, for exactly these failures:
+A Kiro request is retried at most once, with an identical request body and a fresh request id, and only before any output or billing (`meteringEvent`) has been reported, for exactly these failures:
 
-- `InsufficientModelCapacity`, the runtime's capacity rejection.
+- `ThrottlingError` with reason `INSUFFICIENT_MODEL_CAPACITY`, the runtime's capacity rejection.
 - `HTTP 400 ValidationException: Invalid tool use format.`, which the runtime fleet occasionally returns for a fresh remote session's first request. Replaying the same payload succeeds.
-- An event-stream frame cut off before any output, unless the service already sent its billing (`meteringEvent`) frame for the request.
+- A truncated EventStream frame.
 
 A request the service has billed is never replayed. Any other failure, including another HTTP 400 or a stream that ends without output, is terminal and is reported as-is.
 
@@ -96,9 +96,9 @@ Use the Start URL copied from IAM Identity Center. It must be an HTTPS `*.awsapp
 
 Set `KIRO_API_REGION` to the region that issued the key, then run `/login kiro` again and choose API. A region is also required when the key is valid in a route that cannot be discovered from the bootstrap probes.
 
-### `Kiro response has an invalid tokenEndpoint`
+### `Kiro returned an invalid tokenEndpoint`
 
-A present registration endpoint must be the HTTPS regional AWS OIDC token endpoint with no query, fragment, port, or credentials. OMP uses the canonical regional endpoint only when the registration response omits the property. Re-run `/login kiro` after correcting a stale or invalid cached registration.
+A returned registration endpoint must be the HTTPS regional AWS OIDC token endpoint with no query, fragment, port, or credentials. OMP uses the canonical regional endpoint only when the registration response omits the property or returns `null`. Re-run `/login kiro` to register a fresh client.
 
 ### No Kiro models after login
 

@@ -38,9 +38,7 @@ const PROVIDER = "kiro";
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 128 * 1024;
 const KIRO_CLIENT_NAME = "Kiro CLI";
-const KIRO_REFRESH_MARGIN_MS = 60_000;
 export const KIRO_AUTH_MAX_ATTEMPTS = 3;
-export const KIRO_REGISTRATION_EXPIRY_MARGIN_MS = 60_000;
 const DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 
 export const KIRO_IDENTITY_CENTER_SCOPES = [
@@ -753,7 +751,8 @@ export async function refreshKiroToken(
 	current: OAuthCredentials,
 	options: KiroRequestOptions = {},
 ): Promise<OAuthCredentials> {
-	if (current.expires > Date.now() + KIRO_REFRESH_MARGIN_MS) return current;
+	// `OAuthRefresher` decides when a refresh is due; a forced or auth-recovery
+	// refresh hands this hook a row whose stored expiry is still in the future.
 	if (!current.kiroTokenEndpoint || !current.kiroClientId || !current.kiroClientSecret) {
 		throw new AIError.OAuthError("Kiro refresh state is incomplete; run /login kiro again", {
 			kind: "configuration",
@@ -831,14 +830,17 @@ export async function refreshKiroToken(
 	if (!response.response.ok) {
 		// Preserve Kiro's provider-specific re-login message, but classify the
 		// failure structurally so every auth lifecycle path disables the row
-		// without depending on message text.
+		// without depending on message text. Exhausted 429/5xx responses stay transient.
 		const permanent = permanentKiroRefreshFailure(response.body);
-		throw new AIError.OAuthError(permanent ?? `Kiro refresh failed: HTTP ${response.response.status}`, {
+		const error = new AIError.OAuthError(permanent ?? "Kiro refresh failed", {
 			kind: "token-refresh",
 			provider: PROVIDER,
 			status: response.response.status,
 			definitive: permanent !== undefined,
 		});
+		throw retryableHttpStatus(response.response.status)
+			? AIError.attach(error, AIError.create(AIError.Flag.AuthFailed, AIError.Flag.Transient))
+			: error;
 	}
 	return {
 		...current,

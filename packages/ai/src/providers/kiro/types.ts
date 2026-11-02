@@ -90,7 +90,14 @@ export interface KiroRefusalDetails {
 }
 
 export type KiroNormalizedEvent =
-	| { type: "metadata"; requestId?: string; stopReason?: string; refusal?: KiroRefusalDetails }
+	| {
+			type: "metadata";
+			requestId?: string;
+			stopReason?: string;
+			refusal?: KiroRefusalDetails;
+			/** Service-sent `metadataEvent.tokenUsage`. */
+			usage?: KiroUsageMetrics;
+	  }
 	| { type: "reasoning"; text?: string; signature?: string }
 	| { type: "content"; content: string; stopReason?: string }
 	| {

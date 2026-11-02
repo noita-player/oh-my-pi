@@ -1,7 +1,7 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { getOAuthApiKey, getOAuthProvider } from "../registry/oauth";
-import type { OAuthCredentials, OAuthProvider } from "../registry/oauth/types";
+import type { OAuthProvider } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import type { CredentialRankingContext, CredentialRankingStrategy, PlanGate, UsageReport } from "../usage";
 import { isWithinUsageReserve } from "../usage";
@@ -1130,38 +1130,31 @@ export class CredentialSelector {
 		}
 
 		try {
-			let result: { newCredentials: OAuthCredentials; apiKey: string } | null;
+			// Refresh first through the broker-aware single-flighted machinery so
+			// transient failures surface as network errors (5-min temp block)
+			// instead of `getOAuthApiKey`'s "expired" precondition error, which the
+			// definitive-failure regex below would otherwise classify as auth
+			// failure and soft-disable a still-valid credential.
+			const refreshedCredentials = await this.#deps.refresher.refresh(
+				provider,
+				selection.credential,
+				credentialId,
+				options?.signal,
+			);
+			// A broker refresh returns only token fields; project the key from the
+			// stored row merged with them so routing and identity metadata survive.
+			let updated = mergeRefreshedCredential(selection.credential, refreshedCredentials);
+			let apiKey: string;
 			const customProvider = getOAuthProvider(provider);
 			if (customProvider) {
-				const refreshedCredentials = await this.#deps.refresher.refresh(
-					provider,
-					selection.credential,
-					credentialId,
-					options?.signal,
-				);
-				const apiKey = customProvider.getApiKey
-					? customProvider.getApiKey(refreshedCredentials)
-					: refreshedCredentials.access;
-				result = { newCredentials: refreshedCredentials, apiKey };
+				apiKey = customProvider.getApiKey ? customProvider.getApiKey(updated) : updated.access;
 			} else {
-				// Refresh first through the broker-aware single-flighted machinery
-				// so transient failures surface as network errors (5-min temp block)
-				// instead of `getOAuthApiKey`'s "expired" precondition error, which
-				// the definitive-failure regex below would otherwise classify as
-				// auth failure and soft-disable a still-valid credential.
-				const refreshedCredentials = await this.#deps.refresher.refresh(
-					provider,
-					selection.credential,
-					credentialId,
-					options?.signal,
-				);
-				const oauthCreds: Record<string, OAuthCredentials> = {
-					[provider]: refreshedCredentials,
-				};
-				result = await getOAuthApiKey(provider as OAuthProvider, oauthCreds);
+				const result = await getOAuthApiKey(provider as OAuthProvider, { [provider]: updated });
+				if (!result) return undefined;
+				// `getOAuthApiKey` may normalize the expiry; persist what it projected.
+				updated = mergeRefreshedCredential(updated, result.newCredentials);
+				apiKey = result.apiKey;
 			}
-			if (!result) return undefined;
-			const updated = mergeRefreshedCredential(selection.credential, result.newCredentials);
 			if (credentialId !== undefined) {
 				const idx = this.#deps.pool.replaceById(provider, credentialId, updated);
 				if (idx !== -1) selection.index = idx;
@@ -1197,11 +1190,11 @@ export class CredentialSelector {
 					}
 				}
 			}
-			this.#deps.pool.noteBearer(provider, result.apiKey, credentialId);
+			this.#deps.pool.noteBearer(provider, apiKey, credentialId);
 			if (options?.recordAffinity !== false) {
 				this.#deps.affinity.record(provider, sessionId, "oauth", selection.index);
 			}
-			return { apiKey: result.apiKey, credential: updated, credentialId };
+			return { apiKey, credential: updated, credentialId };
 		} catch (error) {
 			const errorMsg = String(error);
 			// Only remove credentials for definitive auth failures

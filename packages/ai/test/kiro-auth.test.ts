@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
@@ -9,7 +9,6 @@ import {
 	KIRO_LOGIN_METHOD_PROMPT,
 	loginKiroDevice,
 	loginKiroHook,
-	refreshKiroHook,
 	refreshKiroToken,
 	selectKiroProfile,
 	validateKiroApiKey,
@@ -90,6 +89,38 @@ function kiroClientCredentials(overrides: Partial<OAuthCredentials> = {}): OAuth
 	};
 }
 
+/** A stored Builder ID login: expired, routing state stamped, no profile ARN. */
+function kiroLogin(overrides: Partial<OAuthCredentials> = {}): OAuthCredentials {
+	return kiroClientCredentials({
+		apiEndpoint: "https://runtime.us-east-1.kiro.dev/",
+		kiroLoginId: "login-a",
+		kiroOidcRegion: "us-east-1",
+		...overrides,
+	});
+}
+
+function oidcOnlyFetch(response: () => Response): typeof fetch {
+	return (async (input: string | URL | Request) => {
+		const url = input instanceof Request ? input.url : String(input);
+		if (url !== "https://oidc.us-east-1.amazonaws.com/token") throw new Error(`unexpected fetch: ${url}`);
+		return response();
+	}) as typeof fetch;
+}
+
+// These tests resolve stored OAuth rows; an env key would otherwise win the
+// fallbacks and an env region would re-route API-key credentials.
+const KIRO_ENV_VARS = ["KIRO_API_KEY", "KIRO_API_REGION"] as const;
+let savedKiroEnv: Array<[string, string | undefined]> = [];
+beforeEach(() => {
+	savedKiroEnv = KIRO_ENV_VARS.map(name => [name, Bun.env[name]]);
+	for (const name of KIRO_ENV_VARS) delete Bun.env[name];
+});
+afterEach(() => {
+	for (const [name, value] of savedKiroEnv) {
+		if (value === undefined) delete Bun.env[name];
+		else Bun.env[name] = value;
+	}
+});
 describe("Kiro authentication", () => {
 	it("normalizes and validates an API key against an explicit region", async () => {
 		const requests: Array<{ url: string; init?: RequestInit }> = [];
@@ -852,24 +883,35 @@ describe("Kiro authentication", () => {
 		expect(JSON.stringify(prompt)).not.toContain("123456789012");
 	});
 
-	it("returns fresh credentials without network when outside the refresh margin", async () => {
-		const current: OAuthCredentials = {
-			...kiroClientCredentials(),
-			access: "fresh-access",
-			expires: Date.now() + 3_600_000,
-		};
-		let called = false;
-		const result = await refreshKiroToken(current, {
-			fetch: async () => {
-				called = true;
-				return json({ accessToken: "unexpected", expiresIn: 3600 });
-			},
-		});
-		expect(result).toBe(current);
-		expect(called).toBe(false);
+	it("re-mints an unexpired stored token on a forced or auth-recovery refresh", async () => {
+		const cases = [
+			{ forceRefresh: true },
+			{ forceRefresh: true, refreshReason: "auth-recovery" as const, rejectedAccessToken: "old-access" },
+		];
+		for (const options of cases) {
+			const store = await SqliteAuthCredentialStore.open(":memory:");
+			const authStorage = new AuthStorage(store);
+			const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+				oidcOnlyFetch(() => json({ accessToken: "new-access", refreshToken: "new-refresh", expiresIn: 3600 })),
+			);
+			try {
+				await authStorage.credentials.set("kiro", {
+					type: "oauth",
+					...kiroLogin({ expires: Date.now() + 3_600_000 }),
+				});
+				const resolved = await authStorage.keys.getWithCredential("kiro", undefined, options);
 
-		const viaHook = await refreshKiroHook(current);
-		expect(viaHook).toBe(current);
+				expect(fetchSpy).toHaveBeenCalledTimes(1);
+				expect(decodeKiroCredential(resolved!.apiKey)).toMatchObject({ kind: "oauth", token: "new-access" });
+				expect(store.listAuthCredentials("kiro")[0]?.credential).toMatchObject({
+					access: "new-access",
+					refresh: "new-refresh",
+				});
+			} finally {
+				fetchSpy.mockRestore();
+				authStorage.close();
+			}
+		}
 	});
 
 	it("rejects incomplete, expired, mismatched, or invalid refresh state without network", async () => {
@@ -970,26 +1012,42 @@ describe("Kiro authentication", () => {
 		expect(retried).toMatchObject({ access: "new-access", refresh: "new-refresh" });
 
 		let semanticAttempts = 0;
-		const unknownClientError = await refreshKiroToken(current, {
-			fetch: async () => {
-				semanticAttempts += 1;
-				return json({ error: "invalid_client" }, 400);
-			},
-		}).catch((cause: unknown) => cause);
-		expect(unknownClientError).toMatchObject({ kind: "token-refresh", status: 400, definitive: false });
-		expect(AIError.isDefinitiveOAuthFailure(unknownClientError)).toBe(false);
-		expect(semanticAttempts).toBe(1);
-
-		for (const oauthCode of ["invalid_grant", "expired_token"]) {
+		for (const { code, status } of [
+			{ code: "invalid_request", status: 400 },
+			{ code: "invalid_client", status: 401 },
+			{ code: "unauthorized_client", status: 400 },
+		]) {
 			const error = await refreshKiroToken(current, {
-				fetch: async () => json({ error: oauthCode, error_description: "must not be reflected" }, 400),
+				fetch: async () => {
+					semanticAttempts += 1;
+					return json({ error: code, error_description: "must not be reflected" }, status);
+				},
 			}).catch((cause: unknown) => cause);
 			expect(error).toMatchObject({
 				kind: "token-refresh",
-				status: 400,
-				definitive: true,
-				message: `Kiro refresh failed: HTTP 400 ${oauthCode}`,
+				status,
+				definitive: false,
+				message: "Kiro refresh failed",
 			});
+			expect(AIError.isDefinitiveOAuthFailure(error)).toBe(false);
+		}
+		expect(semanticAttempts).toBe(3);
+
+		const exhausted = await refreshKiroToken(current, {
+			fetch: async () => json({ error: "server_error" }, 503),
+		}).catch((cause: unknown) => cause);
+		expect(exhausted).toMatchObject({ status: 503, definitive: false, message: "Kiro refresh failed" });
+		expect(AIError.retriable(AIError.classify(exhausted))).toBe(true);
+		expect(AIError.isDefinitiveOAuthFailure(exhausted)).toBe(false);
+
+		for (const [oauthCode, expectedMessage] of [
+			["invalid_grant", "Kiro refresh token was rejected (invalid_grant); run /login kiro again"],
+			["expired_token", "Kiro refresh token expired (expired_token); run /login kiro again"],
+		] as const) {
+			const error = await refreshKiroToken(current, {
+				fetch: async () => json({ error: oauthCode, error_description: "must not be reflected" }, 400),
+			}).catch((cause: unknown) => cause);
+			expect(error).toMatchObject({ kind: "token-refresh", status: 400, definitive: true, message: expectedMessage });
 			expect(AIError.isDefinitiveOAuthFailure(error)).toBe(true);
 		}
 	});
@@ -1085,9 +1143,29 @@ describe("Kiro OAuth API-key projection", () => {
 		expect(result?.apiKey).not.toContain("client-secret");
 	});
 
-	it("resolves one model-cache scope from peek and getOAuthApiKey, fresh or expired", async () => {
-		const store = await SqliteAuthCredentialStore.open(":memory:");
-		const authStorage = new AuthStorage(store);
+	it("asks for a re-login when a stored login lacks its routing state", async () => {
+		const error = await getOAuthApiKey("kiro", {
+			kiro: kiroLogin({ expires: Date.now() + 3_600_000, kiroLoginId: undefined }),
+		}).catch((cause: unknown) => cause);
+		expect(error).toMatchObject({ kind: "configuration", definitive: true });
+	});
+
+	it("asks for a re-login when stored routing values are invalid", async () => {
+		for (const overrides of [
+			{ apiEndpoint: "https://example.com/" },
+			{ orgId: "arn:aws:codewhisperer:us-east-1:not-an-account:profile/bad" },
+		]) {
+			const error = await getOAuthApiKey("kiro", {
+				kiro: kiroLogin({ expires: Date.now() + 3_600_000, ...overrides }),
+			}).catch((cause: unknown) => cause);
+			expect(error).toMatchObject({ kind: "configuration", definitive: true });
+		}
+	});
+
+	it("gives keys.peek and the request path one cache scope for fresh and expired tokens", async () => {
+		const authStorage = new AuthStorage(await SqliteAuthCredentialStore.open(":memory:"));
+		const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (_input: string | URL | Request) =>
+			json({ accessToken: "refreshed-access", expiresIn: 3600 })) as typeof fetch);
 		try {
 			const row = kiroClientCredentials({
 				access: "fresh-access",
@@ -1110,33 +1188,58 @@ describe("Kiro OAuth API-key projection", () => {
 		}
 	});
 
-	it("keeps two expired Builder ID logins on the same endpoint in separate caches", async () => {
-		// Builder ID rows share the endpoint and carry no profile ARN. An expired
-		// row reaches discovery through the refresh path (`getOAuthApiKey`), which
-		// used to drop the login id and fall back to the shared endpoint scope.
-		const scopes: string[] = [];
-		for (const loginId of ["builder-login-a", "builder-login-b"]) {
-			const store = await SqliteAuthCredentialStore.open(":memory:");
-			const authStorage = new AuthStorage(store);
-			try {
-				const expired = kiroClientCredentials({
-					access: `${loginId}-expired`,
-					expires: 1,
-					apiEndpoint: "https://runtime.us-east-1.kiro.dev/",
-					kiroLoginId: loginId,
-				});
-				await authStorage.credentials.set("kiro", { type: "oauth", ...expired });
-				const peeked = await authStorage.keys.peek("kiro", { includeExpired: true });
-				const refreshed = await getOAuthApiKey("kiro", {
-					kiro: { ...expired, access: `${loginId}-refreshed`, expires: Date.now() + 3_600_000 },
-				});
-				expect(resolveKiroModelCacheProviderId(refreshed?.apiKey)).toBe(resolveKiroModelCacheProviderId(peeked));
-				scopes.push(resolveKiroModelCacheProviderId(refreshed?.apiKey));
-			} finally {
-				authStorage.close();
-			}
+	it("keeps peek best-effort for a stored OAuth row without Kiro routing state", async () => {
+		const authStorage = new AuthStorage(await SqliteAuthCredentialStore.open(":memory:"));
+		try {
+			// `credentials.set` admits this shape; discovery must not reject on it.
+			await authStorage.credentials.set("kiro", {
+				type: "oauth",
+				access: "access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 3_600_000,
+			});
+			expect(await authStorage.keys.peek("kiro")).toBeUndefined();
+			expect(await authStorage.keys.peek("kiro", { includeExpired: true })).toBeUndefined();
+		} finally {
+			authStorage.close();
 		}
-		expect(scopes[0]).not.toBe(scopes[1]);
+	});
+});
+
+describe("Kiro delegated refresh", () => {
+	it("keeps stored routing state and cache scope when refresh returns only token fields", async () => {
+		const store = await SqliteAuthCredentialStore.open(":memory:");
+		const authStorage = new AuthStorage(store, {
+			refreshOAuthCredential: async () => ({
+				access: "delegated-access",
+				refresh: "__remote__",
+				expires: Date.now() + 3_600_000,
+			}),
+		});
+		try {
+			await authStorage.credentials.set("kiro", {
+				type: "oauth",
+				...kiroLogin({ expires: 0, orgId: PROFILE_TWO }),
+			});
+			const before = resolveKiroModelCacheProviderId(await authStorage.keys.peek("kiro", { includeExpired: true }));
+
+			const requested = await authStorage.keys.getWithCredential("kiro");
+			expect(decodeKiroCredential(requested!.apiKey, {})).toEqual({
+				kind: "oauth",
+				token: "delegated-access",
+				apiEndpoint: "https://runtime.us-east-1.kiro.dev/",
+				loginId: "login-a",
+				profileArn: PROFILE_TWO,
+			});
+			expect(resolveKiroModelCacheProviderId(requested!.apiKey)).toBe(before);
+			expect(store.listAuthCredentials("kiro")[0]?.credential).toMatchObject({
+				access: "delegated-access",
+				refresh: "__remote__",
+				kiroLoginId: "login-a",
+			});
+		} finally {
+			authStorage.close();
+		}
 	});
 });
 

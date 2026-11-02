@@ -1,7 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { crc32, type EventStreamMessage } from "@oh-my-pi/pi-ai/providers/aws-eventstream";
-import { type KiroRequest, normalizeKiroFrame, streamKiro } from "@oh-my-pi/pi-ai/providers/kiro/index";
+import {
+	isKiroCapacityError,
+	type KiroRequest,
+	normalizeKiroFrame,
+	streamKiro,
+} from "@oh-my-pi/pi-ai/providers/kiro/index";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { AssistantMessageEvent, Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -23,6 +28,19 @@ function oauthApiKey(token: string, profileArn: string): string {
 const TEST_CONTEXT: Context = {
 	messages: [{ role: "user", content: "Say hello", timestamp: 0 }],
 };
+
+const KIRO_ENV_VARS = ["KIRO_API_KEY", "KIRO_API_REGION"] as const;
+let savedKiroEnv: Array<[string, string | undefined]> = [];
+beforeEach(() => {
+	savedKiroEnv = KIRO_ENV_VARS.map(name => [name, Bun.env[name]]);
+	for (const name of KIRO_ENV_VARS) delete Bun.env[name];
+});
+afterEach(() => {
+	for (const [name, value] of savedKiroEnv) {
+		if (value === undefined) delete Bun.env[name];
+		else Bun.env[name] = value;
+	}
+});
 
 function createModel(baseUrl = "https://runtime.us-east-1.kiro.dev/"): Model<"kiro-api"> {
 	return buildModel({
@@ -63,8 +81,8 @@ function encodeStringHeader(name: string, value: string): Uint8Array {
 	return output;
 }
 
-function encodeEventFrame(eventType: string, payload: unknown, messageType = "event"): Uint8Array {
-	const headers = [encodeStringHeader(":message-type", messageType), encodeStringHeader(":event-type", eventType)];
+function encodeFrame(headerValues: Record<string, string>, payloadBytes: Uint8Array): Uint8Array {
+	const headers = Object.entries(headerValues).map(([name, value]) => encodeStringHeader(name, value));
 	const headerLength = headers.reduce((total, header) => total + header.length, 0);
 	const headerBytes = new Uint8Array(headerLength);
 	let headerOffset = 0;
@@ -72,7 +90,6 @@ function encodeEventFrame(eventType: string, payload: unknown, messageType = "ev
 		headerBytes.set(header, headerOffset);
 		headerOffset += header.length;
 	}
-	const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
 	const totalLength = 4 + 4 + 4 + headerLength + payloadBytes.length + 4;
 	const frame = new Uint8Array(totalLength);
 	const view = new DataView(frame.buffer);
@@ -83,6 +100,20 @@ function encodeEventFrame(eventType: string, payload: unknown, messageType = "ev
 	frame.set(payloadBytes, 12 + headerLength);
 	view.setUint32(totalLength - 4, crc32(frame.subarray(0, totalLength - 4)), false);
 	return frame;
+}
+
+function encodeEventFrame(eventType: string, payload: unknown, messageType = "event"): Uint8Array {
+	return encodeFrame(
+		{ ":message-type": messageType, ":event-type": eventType },
+		new TextEncoder().encode(JSON.stringify(payload)),
+	);
+}
+
+function eventStreamResponse(bytes: Uint8Array): Response {
+	return new Response(streamFrom([bytes]), {
+		status: 200,
+		headers: { "content-type": "application/vnd.amazon.eventstream" },
+	});
 }
 
 function concatFrames(frames: readonly Uint8Array[]): Uint8Array {
@@ -124,6 +155,18 @@ function eventMessage(eventType: string, payload: unknown, messageType = "event"
 
 function eventPayload(result: unknown): KiroRequest {
 	return result as KiroRequest;
+}
+
+/** The runtime's `ThrottlingError` body for missing model capacity (Smithy `ThrottlingExceptionReason`). */
+function capacityResponse(): Response {
+	return Response.json(
+		{
+			__type: "com.amazon.aws.codewhisperer#ThrottlingError",
+			message: "I am experiencing high traffic, please try again shortly.",
+			reason: "INSUFFICIENT_MODEL_CAPACITY",
+		},
+		{ status: 429 },
+	);
 }
 
 describe("Kiro event normalization", () => {
@@ -217,6 +260,87 @@ describe("Kiro event normalization", () => {
 				payload: new TextEncoder().encode(JSON.stringify({ message: "slow down" })),
 			}),
 		).toThrow(/ThrottlingException/);
+	});
+
+	test("normalizes service-sent metadataEvent.tokenUsage", () => {
+		expect(
+			normalizeKiroFrame(
+				eventMessage("metadataEvent", {
+					tokenUsage: {
+						uncachedInputTokens: 11,
+						outputTokens: 5,
+						totalTokens: 36,
+						cacheReadInputTokens: 13,
+						cacheWriteInputTokens: 7,
+					},
+				}),
+			),
+		).toEqual({
+			type: "metadata",
+			usage: { inputTokens: 11, outputTokens: 5, cacheReadTokens: 13, cacheWriteTokens: 7 },
+		});
+	});
+
+	test("builds a header-only error frame from its error headers", () => {
+		const thrownBy = (headers: Record<string, string>) => {
+			try {
+				normalizeKiroFrame({ headers, payload: new Uint8Array(0) });
+			} catch (error) {
+				return error as Error;
+			}
+			throw new Error("expected the error frame to throw");
+		};
+
+		const throttle = thrownBy({
+			":message-type": "error",
+			":error-code": "ThrottlingException",
+			":error-message": "Rate exceeded",
+		});
+		expect(throttle).toBeInstanceOf(AIError.ProviderHttpError);
+		expect(throttle.message).toBe("ThrottlingException: Rate exceeded");
+		expect((throttle as AIError.ProviderHttpError).status).toBe(429);
+		expect(AIError.retriable(AIError.classify(throttle))).toBe(true);
+
+		// An unknown header-only failure stays terminal instead of becoming a
+		// transient JSON parse error.
+		const unknown = thrownBy({
+			":message-type": "error",
+			":error-code": "SomeFutureError",
+			":error-message": "Unrecognized failure",
+		});
+		expect(unknown.message).toBe("SomeFutureError: Unrecognized failure");
+		expect(unknown.message).not.toMatch(/JSON/);
+		expect(AIError.retriable(AIError.classify(unknown))).toBe(false);
+	});
+
+	test("recognizes the structured in-stream capacity throttle", () => {
+		const frame = eventMessage(
+			"ThrottlingError",
+			{
+				message: "I am experiencing high traffic, please try again shortly.",
+				reason: "INSUFFICIENT_MODEL_CAPACITY",
+			},
+			"exception",
+		);
+		frame.headers[":exception-type"] = "ThrottlingError";
+		let thrown: unknown;
+		try {
+			normalizeKiroFrame(frame);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(isKiroCapacityError(thrown)).toBe(true);
+		expect((thrown as AIError.ProviderHttpError).status).toBe(429);
+
+		// The reason, not message text, identifies capacity.
+		const textOnly = eventMessage("ThrottlingError", { message: "INSUFFICIENT_MODEL_CAPACITY" }, "exception");
+		textOnly.headers[":exception-type"] = "ThrottlingError";
+		try {
+			normalizeKiroFrame(textOnly);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(isKiroCapacityError(thrown)).toBe(false);
 	});
 });
 
@@ -321,6 +445,44 @@ describe("Kiro stream transport", () => {
 		expect(result.usage).toMatchObject({ input: 7, output: 3, totalTokens: 10 });
 	});
 
+	test("reports zero usage when the service sends no token metrics", async () => {
+		const result = await streamKiro(createModel(), TEST_CONTEXT, {
+			apiKey: "ksk_test",
+			fetch: async () =>
+				responseForEvents([
+					["assistantResponseEvent", { content: "no metrics" }],
+					["contextUsageEvent", { contextUsagePercentage: 50 }],
+				]),
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage).toMatchObject({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 });
+	});
+
+	test("reports metadataEvent token usage including cache reads and writes", async () => {
+		const result = await streamKiro(createModel(), TEST_CONTEXT, {
+			apiKey: "ksk_test",
+			fetch: async () =>
+				responseForEvents([
+					["assistantResponseEvent", { content: "cached" }],
+					[
+						"metadataEvent",
+						{
+							tokenUsage: {
+								uncachedInputTokens: 11,
+								outputTokens: 5,
+								totalTokens: 36,
+								cacheReadInputTokens: 13,
+								cacheWriteInputTokens: 7,
+							},
+						},
+					],
+				]),
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage).toMatchObject({ input: 11, output: 5, cacheRead: 13, cacheWrite: 7, totalTokens: 36 });
+	});
 	test("ignores unknown event payloads before decoding them", async () => {
 		const unknown = encodeEventFrame("futureKiroEvent", {});
 		unknown.set(new TextEncoder().encode("x"), unknown.length - 5);
@@ -387,18 +549,49 @@ describe("Kiro stream transport", () => {
 		expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
 	});
 
-	test("retries one pre-output capacity response", async () => {
+	test("retries one pre-output capacity response with the identical hooked body and real attempt number", async () => {
+		let attempts = 0;
+		let payloadHooks = 0;
+		const waits: number[] = [];
+		const sdkRequests: string[] = [];
+		const bodies: string[] = [];
+		const fetch: FetchImpl = async (_input, init) => {
+			attempts += 1;
+			sdkRequests.push(new Headers(init?.headers).get("amz-sdk-request") ?? "");
+			bodies.push(String(init?.body));
+			if (attempts === 1) return capacityResponse();
+			return responseForEvents([["assistantResponseEvent", { content: "recovered" }]]);
+		};
+		const result = await streamKiro(createModel(), TEST_CONTEXT, {
+			apiKey: TEST_API_KEY,
+			fetch,
+			onPayload: payload => {
+				payloadHooks += 1;
+				return { ...(payload as KiroRequest), agentMode: "vibe" };
+			},
+			providerRetryWait: async delay => {
+				waits.push(delay);
+			},
+		}).result();
+
+		expect(attempts).toBe(2);
+		expect(waits).toEqual([500]);
+		expect(sdkRequests).toEqual(["attempt=1; max=2", "attempt=2; max=2"]);
+		expect(bodies[1]).toBe(bodies[0]);
+		expect(payloadHooks).toBe(1);
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toContainEqual({ type: "text", text: "recovered" });
+	});
+
+	test("leaves high-load failures to the generic retry layer", async () => {
 		let attempts = 0;
 		const waits: number[] = [];
 		const fetch: FetchImpl = async () => {
 			attempts += 1;
-			if (attempts === 1) {
-				return Response.json(
-					{ code: "INSUFFICIENT_MODEL_CAPACITY", message: "try another model" },
-					{ status: 429 },
-				);
-			}
-			return responseForEvents([["assistantResponseEvent", { content: "recovered" }]]);
+			return Response.json(
+				{ message: "Encountered unexpectedly high load when processing the request, please try again." },
+				{ status: 500 },
+			);
 		};
 		const result = await streamKiro(createModel(), TEST_CONTEXT, {
 			apiKey: TEST_API_KEY,
@@ -408,37 +601,11 @@ describe("Kiro stream transport", () => {
 			},
 		}).result();
 
-		expect(attempts).toBe(2);
-		expect(waits).toEqual([500]);
-		expect(result.stopReason).toBe("stop");
-		expect(result.content).toContainEqual({ type: "text", text: "recovered" });
-	});
-
-	test("retries transient high-load failures on the requested model before surfacing them", async () => {
-		let attempts = 0;
-		const waits: number[] = [];
-		const fetch: FetchImpl = async () => {
-			attempts += 1;
-			if (attempts <= 3) {
-				return Response.json(
-					{ message: "Encountered unexpectedly high load when processing the request, please try again." },
-					{ status: 500 },
-				);
-			}
-			return responseForEvents([["assistantResponseEvent", { content: "recovered" }]]);
-		};
-		const result = await streamKiro(createModel(), TEST_CONTEXT, {
-			apiKey: "kiro-token",
-			fetch,
-			providerRetryWait: async delay => {
-				waits.push(delay);
-			},
-		}).result();
-
-		expect(attempts).toBe(4);
-		expect(waits).toEqual([1_000, 2_000, 4_000]);
-		expect(result.stopReason).toBe("stop");
-		expect(result.content).toContainEqual({ type: "text", text: "recovered" });
+		expect(attempts).toBe(1);
+		expect(waits).toEqual([]);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(500);
+		expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(true);
 	});
 
 	test("retries one pre-output transient tool-format rejection", async () => {
@@ -538,6 +705,36 @@ describe("Kiro stream transport", () => {
 		expect(result.errorMessage).toMatch(/not entitled/);
 	});
 
+	test("aborts a successful response when its observer rejects before body decoding", async () => {
+		const cancelled = Promise.withResolvers<void>();
+		let transportSignal: AbortSignal | undefined;
+		const result = await streamKiro(createModel(), TEST_CONTEXT, {
+			apiKey: oauthApiKey("kiro-token", TEST_PROFILE),
+			fetch: async (_input, init) => {
+				transportSignal = init?.signal ?? undefined;
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						pull() {
+							return Promise.withResolvers<void>().promise;
+						},
+						cancel() {
+							cancelled.resolve();
+						},
+					}),
+					{ status: 200 },
+				);
+			},
+			onResponse: async () => {
+				throw new Error("observer failed");
+			},
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("observer failed");
+		expect(transportSignal?.aborted).toBe(true);
+		await cancelled.promise;
+	});
+
 	test("classifies an in-stream throttle as retryable", async () => {
 		// The exception frame rides inside an HTTP 200 body, so without a
 		// status the retry classifier reads the turn as terminal.
@@ -607,7 +804,7 @@ describe("Kiro stream transport", () => {
 			conversationIds.push(payload.conversationState.conversationId);
 			attempts++;
 			return attempts === 1
-				? Response.json({ code: "INSUFFICIENT_MODEL_CAPACITY", message: "try another model" }, { status: 429 })
+				? capacityResponse()
 				: responseForEvents([["assistantResponseEvent", { content: "recovered" }]]);
 		};
 		const result = await streamKiro(createModel(), TEST_CONTEXT, {
@@ -881,6 +1078,81 @@ describe("Kiro stream transport", () => {
 		}).result();
 
 		expect(result.usage).toMatchObject({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 });
+	});
+
+	test("replays an in-stream capacity throttle only before billing", async () => {
+		const capacity = encodeFrame(
+			{ ":message-type": "exception", ":exception-type": "ThrottlingError" },
+			new TextEncoder().encode(
+				JSON.stringify({ message: "I am experiencing high traffic.", reason: "INSUFFICIENT_MODEL_CAPACITY" }),
+			),
+		);
+		const metering = encodeEventFrame("meteringEvent", { unit: "credit", unitPlural: "credits", usage: 0.01 });
+		const recovered = encodeEventFrame("assistantResponseEvent", { content: "recovered" });
+		const run = async (firstAttempt: Uint8Array[]) => {
+			let attempts = 0;
+			const waits: number[] = [];
+			const result = await streamKiro(createModel(), TEST_CONTEXT, {
+				apiKey: "ksk_test",
+				fetch: async () => {
+					attempts += 1;
+					return eventStreamResponse(concatFrames(attempts === 1 ? firstAttempt : [recovered]));
+				},
+				providerRetryWait: async delay => {
+					waits.push(delay);
+				},
+			}).result();
+			return { attempts, waits, result };
+		};
+
+		const unbilled = await run([capacity]);
+		expect(unbilled.attempts).toBe(2);
+		expect(unbilled.waits).toEqual([500]);
+		expect(unbilled.result.content).toEqual([{ type: "text", text: "recovered" }]);
+
+		const billed = await run([metering, capacity]);
+		expect(billed.attempts).toBe(1);
+		expect(billed.waits).toEqual([]);
+		expect(billed.result.stopReason).toBe("error");
+		expect(billed.result.errorMessage).toContain("ThrottlingError");
+	});
+
+	test("aborts the attempt's transport when the first-output deadline expires", async () => {
+		const transportSignals: AbortSignal[] = [];
+		const caller = new AbortController();
+		const result = await streamKiro(createModel(), TEST_CONTEXT, {
+			apiKey: "ksk_test",
+			signal: caller.signal,
+			streamFirstEventTimeoutMs: 20,
+			streamIdleTimeoutMs: 1_000,
+			fetch: async (_input, init) => {
+				const signal = init?.signal;
+				if (!signal) throw new Error("Kiro fetch received no signal");
+				transportSignals.push(signal);
+				// Like a real fetch body: blocks until its request is aborted.
+				const body = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(encodeEventFrame("initial-response", { requestId: "metadata-only" }));
+						signal.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+					},
+				});
+				return new Response(body, {
+					status: 200,
+					headers: { "content-type": "application/vnd.amazon.eventstream" },
+				});
+			},
+			providerRetryWait: async () => {
+				throw new Error("a first-output timeout must not replay");
+			},
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("first visible output");
+		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);
+		expect(transportSignals).toHaveLength(1);
+		expect(transportSignals[0].aborted).toBe(true);
+		expect(transportSignals[0].reason).toBeInstanceOf(AIError.StreamTimeoutError);
+		expect(caller.signal.aborted).toBe(false);
 	});
 
 	test("classifies a reasoning-only terminal response without replaying it", async () => {

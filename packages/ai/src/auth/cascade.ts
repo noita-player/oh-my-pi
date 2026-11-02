@@ -1,5 +1,5 @@
 import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
-import { encodeKiroOAuthRow } from "@oh-my-pi/pi-catalog/wire/kiro-credential";
+import { encodeKiroOAuthCredential } from "../registry/oauth/kiro-credential";
 import { $env, $envExact, logger } from "@oh-my-pi/pi-utils";
 import { type ApiKeyResolver, createOAuthProvenance, markAfterSiblingWait, type ResolvedApiKey } from "../auth-retry";
 import { getEnvApiKey, getEnvApiKeyName } from "../env-api-key";
@@ -290,12 +290,17 @@ export class KeyCascade implements KeysApi {
 					apiEndpoint: oauthSelection.credential.apiEndpoint,
 				});
 			}
-			// Kiro: the same codec `getOAuthApiKey` uses, so a peek and a refresh
-			// of one stored row route and cache identically.
-			if (provider === "kiro") {
-				return encodeKiroOAuthRow(oauthSelection.credential);
+			if (provider !== "kiro") return oauthSelection.credential.access;
+			// `credentials.set` admits OAuth rows without Kiro routing state. Peek is
+			// best-effort, so such a row yields to the later sources instead of
+			// rejecting discovery for every provider.
+			try {
+				return encodeKiroOAuthCredential(oauthSelection.credential);
+			} catch (error) {
+				logger.debug("Skipping Kiro OAuth credential without routing state in peek", {
+					error: error instanceof Error ? error.message : String(error),
+				});
 			}
-			return oauthSelection.credential.access;
 		}
 
 		const loginApiKeySelection = this.#deps.selector.selectByType(

@@ -12,13 +12,19 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
+const KIRO_ENV_KEYS = ["KIRO_API_KEY", "KIRO_API_REGION"] as const;
+
 describe("ModelRegistry Kiro cache isolation", () => {
 	let tempDir: string;
 	let modelsPath: string;
 	let cacheDbPath: string;
 	let authStorage: AuthStorage;
+	// An ambient env key would outrank an expired login, and a region pin would reroute a raw key.
+	let savedEnv: Array<[string, string | undefined]>;
 
 	beforeEach(async () => {
+		savedEnv = KIRO_ENV_KEYS.map(key => [key, Bun.env[key]]);
+		for (const key of KIRO_ENV_KEYS) delete Bun.env[key];
 		tempDir = path.join(os.tmpdir(), `pi-test-kiro-cache-${Snowflake.next()}`);
 		await fs.promises.mkdir(tempDir, { recursive: true });
 		modelsPath = path.join(tempDir, "models.json");
@@ -29,6 +35,10 @@ describe("ModelRegistry Kiro cache isolation", () => {
 	afterEach(() => {
 		authStorage.close();
 		if (fs.existsSync(tempDir)) removeSyncWithRetries(tempDir);
+		for (const [key, value] of savedEnv) {
+			if (value === undefined) delete Bun.env[key];
+			else Bun.env[key] = value;
+		}
 	});
 
 	test("restores only the selected credential's cache and ignores a bare legacy row", async () => {
