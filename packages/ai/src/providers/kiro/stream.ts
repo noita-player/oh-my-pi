@@ -24,9 +24,11 @@ import {
 	iterateWithIdleTimeout,
 } from "../../utils/idle-iterator";
 import { notifyProviderResponse } from "../../utils/provider-response";
+import { waitForRetry } from "../../utils/retry-wait";
 import { decodeEventStream } from "../aws-eventstream";
 import {
 	isKiroCapacityError,
+	isKiroTransientHighLoadError,
 	isKiroTransientToolFormatError,
 	KiroApiError,
 	KiroStreamError,
@@ -36,11 +38,19 @@ import {
 import { mergeKiroUsage, normalizeKiroFrame } from "./event-normalizer";
 import { KiroToolAssembler } from "./tool-assembler";
 import { transformKiroRequest } from "./transform";
-import type { KiroNormalizedEvent, KiroOptions, KiroStreamCredential, KiroUsageMetrics } from "./types";
+import type {
+	KiroNormalizedEvent,
+	KiroOptions,
+	KiroRefusalDetails,
+	KiroStreamCredential,
+	KiroUsageMetrics,
+} from "./types";
 
 const KIRO_RUNTIME_TARGET = "KiroRuntimeService.GenerateAssistantResponse";
 const KIRO_USER_AGENT = "oh-my-pi/kiro-api";
 const MAX_PRE_OUTPUT_RECOVERY_ATTEMPTS = 1;
+const MAX_HIGH_LOAD_RECOVERY_ATTEMPTS = 3;
+const HIGH_LOAD_RETRY_BASE_DELAY_MS = 1_000;
 
 function mergeHeaders(...headerSources: (Record<string, string> | undefined)[]): Record<string, string> {
 	const merged: Record<string, string> = {};
@@ -80,6 +90,7 @@ interface AttemptState {
 	usage: KiroUsageMetrics;
 	contextUsagePercentage?: number;
 	stopReason?: string;
+	refusal?: KiroRefusalDetails;
 	semanticEvents: number;
 	toolAssembler: KiroToolAssembler;
 }
@@ -374,31 +385,43 @@ function createAttempt(model: Model, stream: AssistantMessageEventStream, timest
 	return state;
 }
 
-async function waitBeforeRecovery(options: KiroOptions | undefined, signal: AbortSignal | undefined): Promise<void> {
-	const delayMs = 500;
-	if (options?.providerRetryWait) {
-		await options.providerRetryWait(delayMs, signal);
-		return;
-	}
-	signal?.throwIfAborted();
-	if (!signal) {
-		await Bun.sleep(delayMs);
-		return;
-	}
-	// `Bun.sleep` takes no signal, so race it against abort to keep pre-output
-	// recovery cancellable.
-	const aborted = Promise.withResolvers<never>();
-	const onAbort = () => aborted.reject(signal.reason);
-	signal.addEventListener("abort", onAbort, { once: true });
-	try {
-		await Promise.race([Bun.sleep(delayMs), aborted.promise]);
-	} finally {
-		signal.removeEventListener("abort", onAbort);
-	}
+async function finishError(
+	state: AttemptState,
+	stream: AssistantMessageEventStream,
+	error: unknown,
+	model: Model,
+	signal: AbortSignal | undefined,
+	startTime: number,
+): Promise<void> {
+	const result = await AIError.finalize(error, { api: model.api, provider: model.provider, signal });
+	state.output.stopReason = result.stopReason;
+	state.output.errorMessage = result.message;
+	state.output.errorStatus = result.status;
+	state.output.errorId = result.id;
+	state.output.duration = performance.now() - startTime;
+	if (state.firstOutputTime !== undefined) state.output.ttft = state.firstOutputTime - startTime;
+	stream.push({ type: "error", reason: result.stopReason, error: state.output });
+	stream.end();
 }
 
 function isRecoverablePreOutputStreamFailure(error: unknown): boolean {
 	return error instanceof AIError.EventStreamFrameError && error.message.includes("truncated message");
+}
+
+function preOutputRecoveryDelayMs(error: unknown, visible: boolean, attempt: number): number | undefined {
+	if (visible) return undefined;
+	if (isKiroTransientHighLoadError(error)) {
+		return attempt < MAX_HIGH_LOAD_RECOVERY_ATTEMPTS ? HIGH_LOAD_RETRY_BASE_DELAY_MS * 2 ** attempt : undefined;
+	}
+	if (
+		attempt < MAX_PRE_OUTPUT_RECOVERY_ATTEMPTS &&
+		(isKiroCapacityError(error) ||
+			isKiroTransientToolFormatError(error) ||
+			isRecoverablePreOutputStreamFailure(error))
+	) {
+		return 500;
+	}
+	return undefined;
 }
 
 /** Native Kiro stream implementation. */
@@ -460,13 +483,10 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 				if (!response.ok) {
 					try {
 						const error = await kiroHttpError(response, watchdog.signal);
-						if (
-							(isKiroCapacityError(error) || isKiroTransientToolFormatError(error)) &&
-							recoveryAttempt < MAX_PRE_OUTPUT_RECOVERY_ATTEMPTS &&
-							!state.visible
-						) {
+						const retryDelayMs = preOutputRecoveryDelayMs(error, state.visible, recoveryAttempt);
+						if (retryDelayMs !== undefined) {
 							recoveryAttempt++;
-							await waitBeforeRecovery(options, options.signal);
+							await waitForRetry(options.providerRetryWait, retryDelayMs, options.signal);
 							continue;
 						}
 						throw error;
@@ -517,6 +537,7 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 							case "metadata":
 								if (event.requestId) state.output.responseId = event.requestId;
 								if (event.stopReason) state.stopReason = event.stopReason;
+								if (event.refusal) state.refusal = event.refusal;
 								break;
 							case "reasoning":
 								state.nativeReasoning = true;
@@ -540,23 +561,44 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 						}
 					}
 				} catch (error) {
-					if (
-						!state.visible &&
-						recoveryAttempt < MAX_PRE_OUTPUT_RECOVERY_ATTEMPTS &&
-						isRecoverablePreOutputStreamFailure(error)
-					) {
+					const retryDelayMs = preOutputRecoveryDelayMs(error, state.visible, recoveryAttempt);
+					if (retryDelayMs !== undefined) {
 						recoveryAttempt++;
-						await waitBeforeRecovery(options, options.signal);
+						await waitForRetry(options.providerRetryWait, retryDelayMs, options.signal);
 						continue;
 					}
 					throw error;
 				}
-				state.toolAssembler.finishAll(state.stopReason === "MAX_TOKENS" || state.stopReason === "LENGTH");
+				const contentFiltered = state.stopReason === "CONTENT_FILTERED" || state.refusal !== undefined;
+				state.toolAssembler.finishAll(
+					contentFiltered || state.stopReason === "MAX_TOKENS" || state.stopReason === "LENGTH",
+				);
 				finalizeInline(state, stream);
+				if (contentFiltered) {
+					finalizeUsage(state, model);
+					const category = state.refusal?.category?.trim();
+					const explanation = state.refusal?.explanation?.trim();
+					const label = category ? `Refusal (${category})` : "Refusal";
+					const message = explanation ? `${label}: ${explanation}` : `${label}: content was filtered by Kiro`;
+					state.output.stopDetails = {
+						type: "refusal",
+						category: category ?? null,
+						explanation: explanation ?? null,
+					};
+					await finishError(
+						state,
+						stream,
+						new KiroStreamError(message, { code: "CONTENT_FILTERED", kind: "content-blocked" }),
+						model,
+						options.signal,
+						startTime,
+					);
+					return;
+				}
 				if (!state.visible) {
 					if (recoveryAttempt < MAX_PRE_OUTPUT_RECOVERY_ATTEMPTS) {
 						recoveryAttempt++;
-						await waitBeforeRecovery(options, options.signal);
+						await waitForRetry(options.providerRetryWait, 500, options.signal);
 						continue;
 					}
 					throw new KiroStreamError("Kiro stream ended without visible output", {
@@ -580,19 +622,7 @@ export function streamKiro(model: Model, context: Context, options: KiroOptions 
 				return;
 			}
 		} catch (error) {
-			const result = await AIError.finalize(error, {
-				api: model.api,
-				provider: model.provider,
-				signal: options.signal,
-			});
-			state.output.stopReason = result.stopReason;
-			state.output.errorMessage = result.message;
-			state.output.errorStatus = result.status;
-			state.output.errorId = result.id;
-			state.output.duration = performance.now() - startTime;
-			if (state.firstOutputTime !== undefined) state.output.ttft = state.firstOutputTime - startTime;
-			stream.push({ type: "error", reason: result.stopReason, error: state.output });
-			stream.end();
+			await finishError(state, stream, error, model, options.signal, startTime);
 		}
 	})().catch(error => stream.fail(error));
 	return stream;

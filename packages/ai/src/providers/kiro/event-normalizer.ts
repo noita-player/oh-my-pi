@@ -81,12 +81,21 @@ export function normalizeKiroFrame(message: EventStreamMessage): KiroNormalizedE
 	if (messageType === "exception" || messageType === "error") throw kiroEventStreamError(message.headers, payload);
 
 	if (eventType === "initial-response" || eventType === "metadataEvent") {
-		// The live runtime reports terminal `stopReason` on `metadataEvent`, not on
-		// `assistantResponseEvent`; both spellings are accepted.
+		// The live runtime reports terminal `stopReason` and classifier details on
+		// `metadataEvent`, not on `assistantResponseEvent`; both spellings are accepted.
+		const stopDetails = isRecord(payload.stopDetails) ? payload.stopDetails : undefined;
+		const refusalValue = isRecord(stopDetails?.refusal) ? stopDetails.refusal : undefined;
+		const refusal = refusalValue
+			? {
+					...(typeof refusalValue.category === "string" ? { category: refusalValue.category } : {}),
+					...(typeof refusalValue.explanation === "string" ? { explanation: refusalValue.explanation } : {}),
+				}
+			: undefined;
 		return {
 			type: "metadata",
 			requestId: typeof payload.requestId === "string" ? payload.requestId : undefined,
 			stopReason: typeof payload.stopReason === "string" ? payload.stopReason : undefined,
+			...(refusal ? { refusal } : {}),
 		};
 	}
 	if (eventType === "reasoningContentEvent") {

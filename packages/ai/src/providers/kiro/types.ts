@@ -90,8 +90,13 @@ export interface KiroUsageMetrics {
 	reasoningTokens?: number;
 }
 
+export interface KiroRefusalDetails {
+	category?: string;
+	explanation?: string;
+}
+
 export type KiroNormalizedEvent =
-	| { type: "metadata"; requestId?: string; stopReason?: string }
+	| { type: "metadata"; requestId?: string; stopReason?: string; refusal?: KiroRefusalDetails }
 	| { type: "reasoning"; text?: string; signature?: string }
 	| { type: "content"; content: string; stopReason?: string }
 	| {

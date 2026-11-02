@@ -158,6 +158,47 @@ describe("Kiro event normalization", () => {
 		});
 	});
 
+	test("preserves classifier details from CONTENT_FILTERED metadata", () => {
+		expect(
+			normalizeKiroFrame(
+				eventMessage("metadataEvent", {
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: {
+						refusal: {
+							category: "CYBER",
+							explanation: "The selected model cannot continue this conversation.",
+						},
+					},
+				}),
+			),
+		).toEqual({
+			type: "metadata",
+			stopReason: "CONTENT_FILTERED",
+			refusal: {
+				category: "CYBER",
+				explanation: "The selected model cannot continue this conversation.",
+			},
+		});
+	});
+
+	test("classifies the observed statusless high-load exception as transient", () => {
+		let error: unknown;
+		try {
+			normalizeKiroFrame({
+				headers: { ":message-type": "exception", ":exception-type": "error" },
+				payload: new TextEncoder().encode(
+					JSON.stringify({
+						message: "Encountered unexpectedly high load when processing the request, please try again.",
+					}),
+				),
+			});
+		} catch (cause) {
+			error = cause;
+		}
+		expect(error).toMatchObject({ status: 503 });
+		expect(AIError.is(AIError.classify(error), AIError.Flag.Transient)).toBe(true);
+	});
+
 	test("ignores unknown events and rejects malformed semantic frames", () => {
 		expect(normalizeKiroFrame(eventMessage("futureKiroEvent", { ignored: true }))).toEqual({ type: "ignored" });
 		expect(() => normalizeKiroFrame(eventMessage("assistantResponseEvent", { content: 42 }))).toThrow(
@@ -361,6 +402,33 @@ describe("Kiro stream transport", () => {
 
 		expect(attempts).toBe(2);
 		expect(waits).toEqual([500]);
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toContainEqual({ type: "text", text: "recovered" });
+	});
+
+	test("retries transient high-load failures on the requested model before surfacing them", async () => {
+		let attempts = 0;
+		const waits: number[] = [];
+		const fetch: FetchImpl = async () => {
+			attempts += 1;
+			if (attempts <= 3) {
+				return Response.json(
+					{ message: "Encountered unexpectedly high load when processing the request, please try again." },
+					{ status: 500 },
+				);
+			}
+			return responseForEvents([["assistantResponseEvent", { content: "recovered" }]]);
+		};
+		const result = await streamKiro(createModel(), TEST_CONTEXT, {
+			apiKey: "kiro-token",
+			fetch,
+			providerRetryWait: async delay => {
+				waits.push(delay);
+			},
+		}).result();
+
+		expect(attempts).toBe(4);
+		expect(waits).toEqual([1_000, 2_000, 4_000]);
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toContainEqual({ type: "text", text: "recovered" });
 	});
@@ -708,6 +776,46 @@ describe("Kiro stream transport", () => {
 		expect(result.errorMessage).toContain("first visible output");
 		expect(AIError.is(result.errorId, AIError.Flag.Timeout)).toBe(true);
 		blockedBody.resolve();
+	});
+
+	test("surfaces a CONTENT_FILTERED refusal without replaying the request", async () => {
+		let attempts = 0;
+		const waits: number[] = [];
+		const result = await streamKiro(createModel(), TEST_CONTEXT, {
+			apiKey: "kiro-token",
+			fetch: async () => {
+				attempts += 1;
+				return responseForEvents([
+					[
+						"metadataEvent",
+						{
+							stopReason: "CONTENT_FILTERED",
+							stopDetails: {
+								refusal: {
+									category: "CYBER",
+									explanation: "The selected model cannot continue this conversation.",
+								},
+							},
+						},
+					],
+				]);
+			},
+			providerRetryWait: async delay => {
+				waits.push(delay);
+			},
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(waits).toEqual([]);
+		expect(result.stopReason).toBe("error");
+		expect(result.stopDetails).toEqual({
+			type: "refusal",
+			category: "CYBER",
+			explanation: "The selected model cannot continue this conversation.",
+		});
+		expect(result.errorMessage).toBe("Refusal (CYBER): The selected model cannot continue this conversation.");
+		expect(result.content).toEqual([]);
+		expect(AIError.is(result.errorId, AIError.Flag.ContentBlocked)).toBe(true);
 	});
 
 	test("retries once after a clean no-output response before visible output", async () => {
