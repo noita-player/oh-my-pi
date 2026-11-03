@@ -33,6 +33,9 @@
 
 - Fixed newly published Azure models missing after catalog refresh ([#18173](https://github.com/can1357/oh-my-pi/issues/18173), [#18174](https://github.com/can1357/oh-my-pi/pull/18174) by [@dunkpi](https://github.com/dunkpi))
 - Fixed Factory Droid hiding models when the live-routing family default yields no usable upstream; explicit empty per-model routes still hide them ([#17862](https://github.com/can1357/oh-my-pi/pull/17862) by [@will-bogusz](https://github.com/will-bogusz))
+- Added the `supports-message-threads` compat axis (`supportsMessageThreads`), enabled for Claude 4.5 and newer on the first-party Anthropic provider
+- Added a standard Responses WebSocket capability rule for explicit opt-in through OMP settings or SDK preferences, disabled by default ([#17354](https://github.com/can1357/oh-my-pi/pull/17354) by [@TatsukiMeng](https://github.com/TatsukiMeng))
+- Added Kiro to the model catalog with automatic discovery of every model available to the signed-in Kiro account ([#14215](https://github.com/can1357/oh-my-pi/pull/14215) by [@ajdiyassin](https://github.com/ajdiyassin))
 
 ## [18.16.0] - 2026-11-02
 
