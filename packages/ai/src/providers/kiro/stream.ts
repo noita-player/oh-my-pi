@@ -380,7 +380,6 @@ function shouldRetry(state: AttemptState, attempt: number, error: unknown): bool
 	);
 }
 
-
 /** Native Kiro stream implementation. */
 export function streamKiro(model: Model, context: Context, options: KiroOptions = {}): AssistantMessageEventStream {
 	const stream = new MessageEventStream();

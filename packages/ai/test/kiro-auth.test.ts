@@ -1047,7 +1047,12 @@ describe("Kiro authentication", () => {
 			const error = await refreshKiroToken(current, {
 				fetch: async () => json({ error: oauthCode, error_description: "must not be reflected" }, 400),
 			}).catch((cause: unknown) => cause);
-			expect(error).toMatchObject({ kind: "token-refresh", status: 400, definitive: true, message: expectedMessage });
+			expect(error).toMatchObject({
+				kind: "token-refresh",
+				status: 400,
+				definitive: true,
+				message: expectedMessage,
+			});
 			expect(AIError.isDefinitiveOAuthFailure(error)).toBe(true);
 		}
 	});
@@ -1164,8 +1169,6 @@ describe("Kiro OAuth API-key projection", () => {
 
 	it("gives keys.peek and the request path one cache scope for fresh and expired tokens", async () => {
 		const authStorage = new AuthStorage(await SqliteAuthCredentialStore.open(":memory:"));
-		const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (_input: string | URL | Request) =>
-			json({ accessToken: "refreshed-access", expiresIn: 3600 })) as typeof fetch);
 		try {
 			const row = kiroClientCredentials({
 				access: "fresh-access",
